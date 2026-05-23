@@ -8,30 +8,73 @@ import {
   Activity, Upload, Settings as SettingsIcon, Target, Zap,
   Bike, Footprints, Waves, Calendar, Send, Trash2, AlertCircle,
   Loader2, LayoutDashboard, FileText, Sparkles, X, Check, Edit2,
-  Download, ExternalLink, Dumbbell, Plus, BookOpen, Mic, MicOff, MessageSquare
+  Download, ExternalLink, Dumbbell, Plus, BookOpen, Mic, MicOff, MessageSquare, LogOut
 } from 'lucide-react';
 import Papa from 'papaparse';
+import { supabase, isSupabaseEnabled } from './supabaseClient.js';
 
 // ============================================================
 // Standalone setup — runs outside Claude.ai artifact sandbox
 // ============================================================
 
-// localStorage shim — mimics the async window.storage API from Claude artifacts
+// Cached current user (updated by auth state listener — set up in AppRoot)
+let cachedAuthUser = null;
+export function setCachedAuthUser(u) { cachedAuthUser = u; }
+export function getCachedAuthUser() { return cachedAuthUser; }
+
+// Storage shim — uses Supabase if user is logged in, otherwise localStorage
 if (typeof window !== 'undefined' && !window.storage) {
   window.storage = {
     get: async (key) => {
+      if (cachedAuthUser && supabase) {
+        const { data, error } = await supabase
+          .from('kv_store')
+          .select('value')
+          .eq('user_id', cachedAuthUser.id)
+          .eq('key', key)
+          .maybeSingle();
+        if (error) console.warn('Supabase get error:', error.message);
+        if (!data) return null;
+        const v = typeof data.value === 'string' ? data.value : JSON.stringify(data.value);
+        return { key, value: v, shared: false };
+      }
       const v = localStorage.getItem(key);
       return v !== null ? { key, value: v, shared: false } : null;
     },
     set: async (key, value, shared = false) => {
+      if (cachedAuthUser && supabase) {
+        let storedValue;
+        try { storedValue = JSON.parse(value); } catch { storedValue = value; }
+        const { error } = await supabase
+          .from('kv_store')
+          .upsert(
+            { user_id: cachedAuthUser.id, key, value: storedValue, updated_at: new Date().toISOString() },
+            { onConflict: 'user_id,key' }
+          );
+        if (error) console.warn('Supabase set error:', error.message);
+        return { key, value, shared };
+      }
       localStorage.setItem(key, value);
       return { key, value, shared };
     },
     delete: async (key) => {
+      if (cachedAuthUser && supabase) {
+        const { error } = await supabase
+          .from('kv_store').delete()
+          .eq('user_id', cachedAuthUser.id).eq('key', key);
+        if (error) console.warn('Supabase delete error:', error.message);
+        return { key, deleted: true };
+      }
       localStorage.removeItem(key);
       return { key, deleted: true };
     },
     list: async (prefix) => {
+      if (cachedAuthUser && supabase) {
+        let q = supabase.from('kv_store').select('key').eq('user_id', cachedAuthUser.id);
+        if (prefix) q = q.like('key', `${prefix}%`);
+        const { data } = await q;
+        return { keys: (data || []).map(r => r.key), prefix };
+      }
       const keys = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
@@ -5286,7 +5329,7 @@ function Field({ label, sub, children }) {
 // ============================================================
 // Header & Main App
 // ============================================================
-function Header({ tab, setTab }) {
+function Header({ tab, setTab, authUser, onLogout }) {
   const tabs = [
     { id: 'dashboard',  label: 'Dashboard',  icon: LayoutDashboard },
     { id: 'activities', label: 'Aktywności', icon: FileText },
@@ -5329,12 +5372,30 @@ function Header({ tab, setTab }) {
             );
           })}
         </nav>
+        {authUser && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingLeft: 12, borderLeft: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 11, color: C.muted, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={authUser.email}>
+              {authUser.email}
+            </div>
+            <button
+              onClick={onLogout}
+              title="Wyloguj"
+              style={{
+                background: 'transparent', border: `1px solid ${C.border}`, color: C.muted,
+                cursor: 'pointer', padding: '6px 8px', borderRadius: 6, fontFamily: 'inherit',
+                display: 'inline-flex', alignItems: 'center', transition: 'all 0.15s',
+              }}
+            >
+              <LogOut size={13} />
+            </button>
+          </div>
+        )}
       </div>
     </header>
   );
 }
 
-export default function App() {
+function App({ authUser }) {
   const [activities, setActivities] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [coachHistory, setCoachHistory] = useState([]);
@@ -5468,7 +5529,18 @@ export default function App() {
         button:hover:not(:disabled) { filter: brightness(1.1); }
       `}</style>
 
-      <Header tab={tab} setTab={setTab} />
+      <Header
+        tab={tab}
+        setTab={setTab}
+        authUser={authUser}
+        onLogout={async () => {
+          if (!supabase) return;
+          if (!confirm('Wylogować się?')) return;
+          await supabase.auth.signOut();
+          setCachedAuthUser(null);
+          // AppRoot's onAuthStateChange will handle re-rendering AuthScreen
+        }}
+      />
 
       <main style={{ maxWidth: 1280, margin: '0 auto', padding: '24px 24px 80px' }}>
         {globalManualModal && (
@@ -5502,4 +5574,289 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+// ============================================================
+// AUTH + MIGRATION (Supabase backend integration)
+// ============================================================
+
+function LoadingScreen({ message }) {
+  return (
+    <div style={{
+      minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      flexDirection: 'column', gap: 16, background: C.bg,
+    }}>
+      <Loader2 size={32} className="animate-spin" color={C.muted} />
+      {message && <div style={{ fontSize: 13, color: C.muted }}>{message}</div>}
+    </div>
+  );
+}
+
+function AuthScreen({ onSuccess }) {
+  const [mode, setMode] = useState('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [info, setInfo] = useState(null);
+
+  const handleSubmit = async (e) => {
+    if (e?.preventDefault) e.preventDefault();
+    if (!email || !password) { setError('Wpisz email i hasło'); return; }
+    setLoading(true); setError(null); setInfo(null);
+    try {
+      if (mode === 'login') {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        if (data.user) onSuccess(data.user);
+      } else {
+        const { data, error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        if (data.user && data.session) {
+          onSuccess(data.user);
+        } else {
+          setInfo('Konto utworzone. Możesz się teraz zalogować.');
+          setMode('login');
+        }
+      }
+    } catch (e) {
+      const msg = e.message || 'Nieznany błąd';
+      const polishMsg =
+        /invalid login credentials/i.test(msg) ? 'Nieprawidłowy email lub hasło' :
+        /email.*confirmation/i.test(msg)       ? 'Sprawdź skrzynkę — wysłaliśmy link aktywacyjny' :
+        /password.*should be at least/i.test(msg) ? 'Hasło musi mieć minimum 6 znaków' :
+        /signup.*disabled/i.test(msg)          ? 'Rejestracja zamknięta' :
+        msg;
+      setError(polishMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: C.bg, padding: 20,
+    }}>
+      <Card style={{ width: '100%', maxWidth: 400 }}>
+        <div style={{ textAlign: 'center', marginBottom: 24 }}>
+          <div className="serif" style={{ fontSize: 32, color: C.text, marginBottom: 4, lineHeight: 1 }}>PaceLab</div>
+          <div style={{ fontSize: 13, color: C.muted, marginTop: 8 }}>
+            {mode === 'login' ? 'Zaloguj się żeby kontynuować' : 'Załóż konto'}
+          </div>
+        </div>
+
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <SectionLabel>Email</SectionLabel>
+            <Input
+              type="email" value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="ty@example.com" autoComplete="email"
+            />
+          </div>
+          <div>
+            <SectionLabel>Hasło</SectionLabel>
+            <Input
+              type="password" value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={mode === 'signup' ? 'Minimum 6 znaków' : '••••••••'}
+              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleSubmit(); }}
+            />
+          </div>
+
+          {error && (
+            <div style={{
+              padding: '10px 12px', background: C.red + '15', color: C.red,
+              borderRadius: 8, fontSize: 12, border: `1px solid ${C.red}30`,
+            }}>{error}</div>
+          )}
+
+          {info && (
+            <div style={{
+              padding: '10px 12px', background: C.lime + '15', color: C.lime,
+              borderRadius: 8, fontSize: 12, border: `1px solid ${C.lime}30`,
+            }}>{info}</div>
+          )}
+
+          <Btn
+            variant="primary" onClick={handleSubmit} disabled={loading}
+            style={{ justifyContent: 'center', padding: '10px 14px', marginTop: 4 }}
+          >
+            {loading ? <Loader2 size={14} className="animate-spin" /> : null}
+            {loading ? 'Czekaj...' : mode === 'login' ? 'Zaloguj się' : 'Załóż konto'}
+          </Btn>
+        </form>
+
+        <div style={{
+          marginTop: 18, paddingTop: 18, borderTop: `1px solid ${C.border}`,
+          textAlign: 'center', fontSize: 12, color: C.muted,
+        }}>
+          {mode === 'login' ? (
+            <span>Nie masz jeszcze konta?{' '}
+              <button onClick={() => { setMode('signup'); setError(null); setInfo(null); }} style={{
+                background: 'transparent', border: 'none', color: C.cyan, cursor: 'pointer',
+                fontFamily: 'inherit', fontSize: 12, padding: 0, textDecoration: 'underline',
+              }}>Zarejestruj się</button>
+            </span>
+          ) : (
+            <span>Masz już konto?{' '}
+              <button onClick={() => { setMode('login'); setError(null); setInfo(null); }} style={{
+                background: 'transparent', border: 'none', color: C.cyan, cursor: 'pointer',
+                fontFamily: 'inherit', fontSize: 12, padding: 0, textDecoration: 'underline',
+              }}>Zaloguj się</button>
+            </span>
+          )}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function MigrationPrompt({ user, onDone }) {
+  const [info, setInfo] = useState(null);
+  const [migrating, setMigrating] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let activityCount = 0;
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('pacelab:') && k !== 'pacelab-auth') keys.push(k);
+    }
+    try {
+      const main = localStorage.getItem('pacelab:v1');
+      if (main) {
+        const parsed = JSON.parse(main);
+        activityCount = parsed.activities?.length || 0;
+      }
+    } catch {}
+    setInfo({ keys, activityCount });
+  }, []);
+
+  const handleMigrate = async () => {
+    setMigrating(true); setError(null);
+    try {
+      const rows = [];
+      for (const key of info.keys) {
+        const raw = localStorage.getItem(key);
+        if (raw === null) continue;
+        let value;
+        try { value = JSON.parse(raw); } catch { value = raw; }
+        rows.push({ user_id: user.id, key, value, updated_at: new Date().toISOString() });
+      }
+      if (rows.length > 0) {
+        const { error: err } = await supabase.from('kv_store').upsert(rows, { onConflict: 'user_id,key' });
+        if (err) throw err;
+      }
+      setDone(true);
+    } catch (e) {
+      setError(e.message || 'Błąd migracji');
+    } finally {
+      setMigrating(false);
+    }
+  };
+
+  if (!info) return <LoadingScreen message="Sprawdzam dane lokalne..." />;
+
+  if (done) return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.bg, padding: 20 }}>
+      <Card style={{ maxWidth: 400, textAlign: 'center' }}>
+        <div style={{ fontSize: 36, color: C.lime, marginBottom: 8 }}>✓</div>
+        <div style={{ fontSize: 18, fontWeight: 500, marginBottom: 8 }}>Migracja zakończona</div>
+        <div style={{ fontSize: 13, color: C.textDim, marginBottom: 20, lineHeight: 1.6 }}>
+          Twoje dane są w chmurze. Dostępne z każdego urządzenia po zalogowaniu.
+        </div>
+        <Btn variant="primary" onClick={onDone} style={{ padding: '10px 20px' }}>Otwórz PaceLab</Btn>
+      </Card>
+    </div>
+  );
+
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.bg, padding: 20 }}>
+      <Card style={{ maxWidth: 480 }}>
+        <div className="serif" style={{ fontSize: 24, marginBottom: 8 }}>Wykryto lokalne dane</div>
+        <div style={{ fontSize: 13, color: C.textDim, lineHeight: 1.6, marginBottom: 20 }}>
+          Twoja przeglądarka ma {info.activityCount > 0 ? <strong>{info.activityCount} aktywności</strong> : <strong>dane PaceLab</strong>} zapisanych lokalnie.
+          Chcesz przenieść je do chmury żeby były dostępne na innych urządzeniach?
+        </div>
+
+        {error && (
+          <div style={{ padding: '10px 12px', background: C.red + '15', color: C.red, borderRadius: 8, fontSize: 12, marginBottom: 16 }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+          <Btn variant="ghost" onClick={onDone} disabled={migrating}>Pomiń, zacznij od zera</Btn>
+          <Btn variant="primary" onClick={handleMigrate} disabled={migrating}>
+            {migrating ? <Loader2 size={14} className="animate-spin" /> : null}
+            {migrating ? 'Przenoszę...' : 'Tak, przenieś'}
+          </Btn>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+export default function AppRoot() {
+  const [authChecked, setAuthChecked] = useState(!isSupabaseEnabled);
+  const [authUser, setAuthUser] = useState(null);
+  const [needsMigration, setNeedsMigration] = useState(false);
+  const [migrationChecked, setMigrationChecked] = useState(!isSupabaseEnabled);
+
+  useEffect(() => {
+    if (!isSupabaseEnabled) return;
+
+    const checkMigration = async (user) => {
+      try {
+        const { data } = await supabase.from('kv_store').select('key').eq('user_id', user.id).limit(1);
+        const hasCloudData = data && data.length > 0;
+        let hasLocalData = false;
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith('pacelab:') && k !== 'pacelab-auth') { hasLocalData = true; break; }
+        }
+        setNeedsMigration(!hasCloudData && hasLocalData);
+      } catch (e) {
+        console.warn('Migration check failed:', e);
+      } finally {
+        setMigrationChecked(true);
+      }
+    };
+
+    supabase.auth.getSession().then(({ data }) => {
+      const u = data?.session?.user || null;
+      setCachedAuthUser(u);
+      setAuthUser(u);
+      setAuthChecked(true);
+      if (u) checkMigration(u);
+      else setMigrationChecked(true);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      const u = session?.user || null;
+      setCachedAuthUser(u);
+      setAuthUser(u);
+      if (event === 'SIGNED_IN' && u) {
+        setMigrationChecked(false);
+        checkMigration(u);
+      } else if (event === 'SIGNED_OUT') {
+        setNeedsMigration(false);
+        setMigrationChecked(true);
+      }
+    });
+
+    return () => sub?.subscription?.unsubscribe?.();
+  }, []);
+
+  if (!authChecked) return <LoadingScreen message="Sprawdzam sesję..." />;
+  if (isSupabaseEnabled && !authUser) return <AuthScreen onSuccess={(u) => { setCachedAuthUser(u); setAuthUser(u); }} />;
+  if (!migrationChecked) return <LoadingScreen message="Sprawdzam dane..." />;
+  if (needsMigration) return <MigrationPrompt user={authUser} onDone={() => setNeedsMigration(false)} />;
+
+  return <App authUser={authUser} />;
 }
