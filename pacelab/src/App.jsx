@@ -955,6 +955,16 @@ function parseGarminCSV(text) {
     return parts[0] || 0;
   };
 
+  // Pace string "5:44" → seconds (per km for run, per 100m for swim). Keep raw too.
+  const paceToSec = (t) => {
+    if (!t || t === '--') return null;
+    const parts = String(t).split(':').map(p => parseFloat(p));
+    if (parts.some(isNaN)) return null;
+    if (parts.length === 2) return parts[0]*60 + parts[1];
+    if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
+    return null;
+  };
+
   const out = [];
   parsed.data.forEach((row, i) => {
     const typeRaw = String(col(row, 'Typ aktywności', 'Activity Type') || '').toLowerCase();
@@ -962,14 +972,16 @@ function parseGarminCSV(text) {
     if (typeRaw.includes('kolar') || typeRaw.includes('cycl') || typeRaw.includes('bik') || typeRaw.includes('rower')) sport = 'cycling';
     else if (typeRaw.includes('bieg') || typeRaw.includes('run')) sport = 'running';
     else if (typeRaw.includes('pływ') || typeRaw.includes('swim')) sport = 'swimming';
+    else if (typeRaw.includes('sił') || typeRaw.includes('strength') || typeRaw.includes('siła')) sport = 'strength';
+
+    const isOpenWater = typeRaw.includes('open') || typeRaw.includes('otwart');
 
     const dateRaw = col(row, 'Data', 'Date') || '';
     if (!dateRaw) return;
-    // "2026-05-17 09:24:21" → ISO. Assume local time, convert naively.
     const date = dateRaw.includes('T') ? dateRaw : dateRaw.replace(' ', 'T');
 
     const durationSec = Math.round(timeToSec(col(row, 'Czas', 'Time')));
-    if (durationSec <= 0) return;
+    if (durationSec <= 0 && sport !== 'strength') return;
 
     // Distance: km for most sports, meters for swimming (Garmin quirk)
     let distanceM = 0;
@@ -988,16 +1000,95 @@ function parseGarminCSV(text) {
     const npN = num(col(row, 'Normalized Power® (NP®)', 'Normalized Power', 'Normalized Power®'));
     const garminTSS = num(col(row, 'Training Stress Score® (TSS®)', 'TSS', 'Training Stress Score®'));
 
+    // Running dynamics
+    const avgRunCadence = num(col(row, 'Średnia kadencja biegu', 'Avg Run Cadence'));
+    const maxRunCadence = num(col(row, 'Maksymalna kadencja biegu', 'Max Run Cadence'));
+    const strideLength = num(col(row, 'Średnia długość kroku', 'Avg Stride Length'));
+    const vertOscillation = num(col(row, 'Średnie odchylenie pionowe', 'Avg Vertical Oscillation'));
+    const vertRatio = num(col(row, 'Średnie odchylenie do długości', 'Avg Vertical Ratio'));
+    const groundContact = num(col(row, 'Średni czas kontaktu z podłożem', 'Avg Ground Contact Time'));
+
+    // Pace metrics (store both raw display + seconds)
+    const avgPaceRaw = col(row, 'Średnie tempo', 'Avg Pace');
+    const bestPaceRaw = col(row, 'Najlepsze tempo', 'Best Pace');
+    const gapRaw = col(row, 'Średni GAP', 'Avg GAP');
+
+    // Elevation
+    const totalAscent = num(col(row, 'Całkowity wznios', 'Total Ascent'));
+    const totalDescent = num(col(row, 'Całkowity spadek', 'Total Descent'));
+    const minElevation = num(col(row, 'Minimalna wysokość', 'Min Elevation'));
+    const maxElevation = num(col(row, 'Maksymalna wysokość', 'Max Elevation'));
+
+    // Power extras
+    const maxPower = num(col(row, 'Maksymalna moc', 'Max Power'));
+
+    // Swimming
+    const totalStrokes = num(col(row, 'Łącznie ruchów', 'Total Strokes'));
+    const avgSwolf = num(col(row, 'Średni Swolf', 'Avg Swolf'));
+    const avgStrokeRate = col(row, 'Średnie tempo ruchów', 'Avg Stroke Rate');
+
+    // Strength
+    const totalReps = num(col(row, 'Razem powtórzeń', 'Total Reps'));
+    const totalSets = num(col(row, 'Razem serii', 'Total Sets'));
+
+    // General
+    const calories = num(col(row, 'Suma kalorii', 'Calories'));
+    const aerobicTE = num(col(row, 'Aerobowy TE', 'Aerobic TE', 'Training Effect'));
+    const steps = num(col(row, 'Kroki', 'Steps'));
+    const bodyBatteryDrain = num(col(row, 'Utrata Body Battery', 'Body Battery Drain'));
+    const minTemp = num(col(row, 'Minimalna temperatura', 'Min Temp'));
+    const maxTemp = num(col(row, 'Maksymalna temperatura', 'Max Temp'));
+    const laps = num(col(row, 'Liczba okrążeń', 'Number of Laps', 'Laps'));
+    const movingTime = timeToSec(col(row, 'Czas ruchu', 'Moving Time'));
+    const elapsedTime = timeToSec(col(row, 'Upłynęło czasu', 'Elapsed Time'));
+
     const a = {
       id: `csv_${date}_${i}`,
       date,
       sport,
+      isOpenWater: sport === 'swimming' ? isOpenWater : undefined,
       durationSec,
       distanceM,
       avgHR: avgHRn ? Math.round(avgHRn) : null,
       maxHR: maxHRn ? Math.round(maxHRn) : null,
       avgPower: avgPowerN ? Math.round(avgPowerN) : null,
+      maxPower: maxPower ? Math.round(maxPower) : null,
       normalizedPower: npN ? Math.round(npN) : null,
+      // Running dynamics
+      avgCadence: avgRunCadence ? Math.round(avgRunCadence) : null,
+      maxCadence: maxRunCadence ? Math.round(maxRunCadence) : null,
+      strideLength: strideLength,
+      vertOscillation: vertOscillation,
+      vertRatio: vertRatio,
+      groundContact: groundContact ? Math.round(groundContact) : null,
+      // Pace
+      avgPaceRaw: avgPaceRaw,
+      avgPaceSec: paceToSec(avgPaceRaw),
+      bestPaceRaw: bestPaceRaw,
+      gapRaw: gapRaw,
+      // Elevation
+      totalAscent: totalAscent,
+      totalDescent: totalDescent,
+      minElevation: minElevation,
+      maxElevation: maxElevation,
+      // Swimming
+      totalStrokes: totalStrokes,
+      avgSwolf: avgSwolf,
+      avgStrokeRate: avgStrokeRate,
+      // Strength
+      totalReps: totalReps,
+      totalSets: totalSets,
+      // General health
+      calories: calories ? Math.round(calories) : null,
+      aerobicTE: aerobicTE,
+      steps: steps ? Math.round(steps) : null,
+      bodyBatteryDrain: bodyBatteryDrain,
+      minTemp: minTemp,
+      maxTemp: maxTemp,
+      laps: laps ? Math.round(laps) : null,
+      movingTimeSec: movingTime > 0 ? Math.round(movingTime) : null,
+      elapsedTimeSec: elapsedTime > 0 ? Math.round(elapsedTime) : null,
+      nutrition: [],
       source: 'csv',
       name: col(row, 'Tytuł', 'Title') || '',
     };
@@ -1346,6 +1437,7 @@ function ActivityRow({ a, onDelete, onEdit, editable, analyzable, analysis, anal
           {onUpdateNutrition && (
             <NutritionLog activity={a} onChange={(list) => onUpdateNutrition(a.id, list)} />
           )}
+          <AllMetrics activity={a} />
           <SplitsTable activity={a} />
           <HRDriftChart activity={a} />
           <MapView activity={a} />
@@ -2483,6 +2575,29 @@ function Activities({ activities, setActivities, pmcData, settings, recovery }) 
       ).join('\n');
     }
 
+    // Extra metrics block — running dynamics, elevation, swim, strength, environment
+    let extraBlock = '';
+    const ex = [];
+    if (activity.aerobicTE) ex.push(`Aerobic TE: ${activity.aerobicTE}/5`);
+    if (activity.calories) ex.push(`Kalorie: ${activity.calories} kcal`);
+    if (activity.sport === 'running') {
+      if (activity.strideLength) ex.push(`Długość kroku: ${activity.strideLength} m`);
+      if (activity.vertOscillation) ex.push(`Oscylacja pionowa: ${activity.vertOscillation} cm`);
+      if (activity.groundContact) ex.push(`Czas kontaktu z podłożem: ${activity.groundContact} ms`);
+      if (activity.gapRaw) ex.push(`GAP (tempo skorygowane o przewyższenia): ${activity.gapRaw}/km`);
+    }
+    if (activity.sport === 'swimming') {
+      if (activity.avgSwolf) ex.push(`SWOLF: ${activity.avgSwolf}`);
+      if (activity.totalStrokes) ex.push(`Ruchy łącznie: ${activity.totalStrokes}`);
+    }
+    if (activity.sport === 'strength') {
+      if (activity.totalReps) ex.push(`Powtórzenia: ${activity.totalReps}, serie: ${activity.totalSets || '–'}`);
+    }
+    if (activity.totalAscent) ex.push(`Wznios: ${activity.totalAscent} m`);
+    if (activity.maxTemp) ex.push(`Temperatura: ${activity.minTemp ?? '?'}–${activity.maxTemp}°C`);
+    if (activity.bodyBatteryDrain) ex.push(`Utrata Body Battery: ${activity.bodyBatteryDrain}`);
+    if (ex.length > 0) extraBlock = '\n' + ex.join('\n');
+
     const actLine = `Data: ${fmtDateFull(activity.date)}
 Sport: ${sportLabel}
 Czas: ${fmtDur(activity.durationSec)}
@@ -2493,7 +2608,7 @@ Kadencja średnia: ${activity.avgCadence ? activity.avgCadence + ' spm' : '–'}
 Moc średnia: ${activity.avgPower ? activity.avgPower + ' W' : '–'}
 Normalized Power: ${activity.normalizedPower ? activity.normalizedPower + ' W' : '–'}
 TSS: ${activity.tss}${activity.rpe ? `\nRPE (odczucie): ${activity.rpe}/10` : ''}${activity.decoupling !== null && activity.decoupling !== undefined ? `
-Decoupling (aerobic drift): ${activity.decoupling > 0 ? '+' : ''}${activity.decoupling.toFixed(1)}% (>10% = drift, <5% = świetnie)` : ''}${splitsBlock}${driftBlock}${nutritionBlock}`;
+Decoupling (aerobic drift): ${activity.decoupling > 0 ? '+' : ''}${activity.decoupling.toFixed(1)}% (>10% = drift, <5% = świetnie)` : ''}${extraBlock}${splitsBlock}${driftBlock}${nutritionBlock}`;
 
     const system = `Jesteś ekspertem od treningu wytrzymałościowego analizującym JEDEN trening triathlonisty-amatora.
 
@@ -4568,6 +4683,92 @@ function NutritionLog({ activity, onChange }) {
           </div>
         </div>
       )}
+    </Card>
+  );
+}
+
+// Displays all captured Garmin metrics, sport-aware, in a labeled grid.
+function AllMetrics({ activity: a }) {
+  const fmtSec = (s) => {
+    if (s === null || s === undefined) return null;
+    const m = Math.floor(s / 60), sec = Math.round(s % 60);
+    return `${m}:${String(sec).padStart(2,'0')}`;
+  };
+
+  // Build metric list per sport
+  const metrics = [];
+  const push = (label, value, unit = '', accent) => {
+    if (value === null || value === undefined || value === '' || value === '--') return;
+    metrics.push({ label, value, unit, accent });
+  };
+
+  // Universal
+  push('Kalorie', a.calories, 'kcal', C.amber);
+  if (a.aerobicTE) push('Aerobic TE', a.aerobicTE, '/5', a.aerobicTE >= 3 ? C.lime : C.textDim);
+  if (a.bodyBatteryDrain) push('Body Battery', a.bodyBatteryDrain, '', C.pink);
+
+  if (a.sport === 'running') {
+    push('Kadencja śr.', a.avgCadence, 'spm', a.avgCadence && a.avgCadence < 175 ? C.amber : C.cyan);
+    push('Kadencja max', a.maxCadence, 'spm');
+    push('Długość kroku', a.strideLength, 'm');
+    push('Oscylacja pionowa', a.vertOscillation, 'cm');
+    push('Stosunek pionowy', a.vertRatio, '%');
+    push('Kontakt z podłożem', a.groundContact, 'ms');
+    if (a.bestPaceRaw) push('Najlepsze tempo', a.bestPaceRaw, '/km', C.lime);
+    if (a.gapRaw) push('GAP (skoryg.)', a.gapRaw, '/km');
+    push('Kroki', a.steps, '');
+  }
+
+  if (a.sport === 'cycling') {
+    push('Moc max', a.maxPower, 'W', C.purple);
+    push('Prędkość max', a.bestPaceRaw, 'km/h');
+  }
+
+  if (a.sport === 'swimming') {
+    push('SWOLF', a.avgSwolf, '', C.cyan);
+    push('Ruchy łącznie', a.totalStrokes, '');
+    if (a.avgStrokeRate) push('Tempo ruchów', a.avgStrokeRate, '/min');
+    push('Okrążenia', a.laps, '');
+    if (a.bestPaceRaw) push('Najlepsze tempo', a.bestPaceRaw, '/100m', C.lime);
+  }
+
+  if (a.sport === 'strength') {
+    push('Powtórzenia', a.totalReps, '', C.purple);
+    push('Serie', a.totalSets, '');
+  }
+
+  // Elevation (run/bike outdoor)
+  if (a.sport === 'running' || a.sport === 'cycling') {
+    push('Wznios', a.totalAscent, 'm', C.lime);
+    push('Spadek', a.totalDescent, 'm');
+  }
+
+  // Temperature
+  if (a.minTemp !== null && a.minTemp !== undefined) {
+    const t = a.maxTemp && a.maxTemp !== a.minTemp ? `${a.minTemp}–${a.maxTemp}` : `${a.minTemp}`;
+    push('Temperatura', t, '°C');
+  }
+
+  if (metrics.length === 0) return null;
+
+  return (
+    <Card>
+      <SectionLabel>Wszystkie metryki</SectionLabel>
+      <div style={{
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+        gap: 10, marginTop: 12,
+      }}>
+        {metrics.map((m, i) => (
+          <div key={i} style={{ padding: '10px 12px', background: C.surfaceAlt, borderRadius: 8 }}>
+            <div className="mono" style={{ fontSize: 9, color: C.muted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>
+              {m.label}
+            </div>
+            <div className="mono" style={{ fontSize: 16, fontWeight: 600, color: m.accent || C.text, lineHeight: 1 }}>
+              {m.value}<span style={{ fontSize: 10, color: C.muted, fontWeight: 400, marginLeft: 2 }}>{m.unit}</span>
+            </div>
+          </div>
+        ))}
+      </div>
     </Card>
   );
 }
