@@ -113,25 +113,90 @@ async function callClaude(body) {
 // ============================================================
 // Theme
 // ============================================================
-const C = {
-  // Surfaces — biały z subtelnymi tłami szarymi
-  bg: '#fafbfc',          // główne tło — bardzo lekko offwhite, mniej męczące niż czysta biel
-  surface: '#ffffff',     // karty
-  surfaceAlt: '#f3f5f7',  // sekcje wewnątrz kart, header'y tabel
-  surfaceHi: '#eef1f4',   // hover'y
-  border: '#e3e7eb',      // linie separujące
-  borderAlt: '#d2d8de',   // mocniejsze obramowanie
-  // Text — duży kontrast, łatwa czytelność
-  text: '#0f1419',        // pełen kontrast 16.5:1 vs białym
-  textDim: '#3f4956',     // wtórny tekst, kontrast 9.5:1
-  muted: '#6b7680',       // metadane, etykiety — kontrast 4.7:1 (przekracza WCAG AA)
-  // Accenty — ściemnione żeby były czytelne na białym (zielony lime był za jasny)
-  lime: '#5a8a00',        // ciemniejszy zielony, kontrast 5.2:1 z białym
-  cyan: '#0066b3',        // ciemniejszy niebieski, kontrast 6.2:1
-  amber: '#a86700',       // ciemniejszy bursztyn, kontrast 4.8:1
-  red: '#c92a0c',         // ciemniejszy czerwony, kontrast 5.7:1
-  pink: '#b8246d',        // ciemniejszy róż, kontrast 6.4:1
+// Theme palettes — dark default (TrainX-inspired), light optional via toggle in Settings
+const PALETTES = {
+  dark: {
+    bg: '#0a0d12',          // deep navy/charcoal
+    surface: '#11161d',     // cards
+    surfaceAlt: '#161c25',  // sections inside cards
+    surfaceHi: '#1d2430',   // hovers
+    border: '#1f2733',
+    borderAlt: '#2d3845',
+    text: '#e8edf3',
+    textDim: '#a3afbe',
+    muted: '#6b7886',
+    // Vibrant accents on dark — full saturation
+    lime: '#a3ff3a',
+    cyan: '#33d9ff',
+    amber: '#ffba2e',
+    red: '#ff5547',
+    pink: '#ff4d9a',
+    purple: '#9d6bff',
+  },
+  light: {
+    bg: '#fafbfc',
+    surface: '#ffffff',
+    surfaceAlt: '#f3f5f7',
+    surfaceHi: '#eef1f4',
+    border: '#e3e7eb',
+    borderAlt: '#d2d8de',
+    text: '#0f1419',
+    textDim: '#3f4956',
+    muted: '#6b7680',
+    lime: '#5a8a00',
+    cyan: '#0066b3',
+    amber: '#a86700',
+    red: '#c92a0c',
+    pink: '#b8246d',
+    purple: '#6d3eb8',
+  },
 };
+
+// Default theme: dark. Read from localStorage if user changed.
+function getInitialTheme() {
+  if (typeof window === 'undefined') return 'dark';
+  try { return localStorage.getItem('pacelab:theme') || 'dark'; } catch { return 'dark'; }
+}
+
+// C is a *live* binding — set by ThemeProvider at runtime. Initialized to dark for module-level access.
+let C = PALETTES[getInitialTheme()];
+function setTheme(name) {
+  const next = PALETTES[name] ? name : 'dark';
+  C = PALETTES[next];
+  try { localStorage.setItem('pacelab:theme', next); } catch {}
+  // Update body bg + meta theme-color
+  if (typeof document !== 'undefined') {
+    document.body.style.background = C.bg;
+    document.body.style.color = C.text;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', C.bg);
+  }
+}
+// Apply initial theme to DOM on module load
+if (typeof document !== 'undefined') {
+  setTimeout(() => setTheme(getInitialTheme()), 0);
+}
+
+// Theme subscription — components call useTheme() to re-render on toggle
+const themeListeners = new Set();
+function notifyThemeChange() { themeListeners.forEach(fn => fn()); }
+function useTheme() {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const listener = () => force(x => x + 1);
+    themeListeners.add(listener);
+    return () => themeListeners.delete(listener);
+  }, []);
+  return {
+    name: typeof localStorage !== 'undefined' ? (localStorage.getItem('pacelab:theme') || 'dark') : 'dark',
+    toggle: () => {
+      const cur = localStorage.getItem('pacelab:theme') || 'dark';
+      setTheme(cur === 'dark' ? 'light' : 'dark');
+      notifyThemeChange();
+    },
+    set: (name) => { setTheme(name); notifyThemeChange(); },
+  };
+}
 
 const STORAGE_KEY = 'pacelab:v1';
 
@@ -500,6 +565,98 @@ function computePowerDurationCurve(activity) {
   return result;
 }
 
+// Per-kilometer splits — pace, avg HR, avg cadence for each km.
+// Uses cumulative distance + timestamps from samples.
+function computeSplits(activity) {
+  if (!activity.samples || activity.samples.length < 5) return null;
+  if (activity.sport !== 'running' && activity.sport !== 'cycling') return null;
+
+  // Samples need distance. TCX stores cumulative distance; if missing, derive from GPS.
+  let samples = activity.samples;
+  const haveDist = samples.some(s => s.d !== undefined && s.d !== null);
+
+  // If no distance field, derive cumulative distance from GPS coords (haversine)
+  let withDist = [];
+  if (haveDist) {
+    withDist = samples.map(s => ({ t: s.t, dist: s.d, h: s.h, c: s.c }));
+  } else if (samples.some(s => s.la !== null && s.la !== undefined)) {
+    let cum = 0, prevLa = null, prevLo = null;
+    for (const s of samples) {
+      if (s.la === null || s.la === undefined) continue;
+      if (prevLa !== null) {
+        const R = 6371000;
+        const dLat = (s.la - prevLa) * Math.PI / 180;
+        const dLon = (s.lo - prevLo) * Math.PI / 180;
+        const a = Math.sin(dLat/2)**2 + Math.cos(prevLa*Math.PI/180)*Math.cos(s.la*Math.PI/180)*Math.sin(dLon/2)**2;
+        cum += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      }
+      prevLa = s.la; prevLo = s.lo;
+      withDist.push({ t: s.t, dist: cum, h: s.h, c: s.c });
+    }
+  } else {
+    return null; // no way to compute distance
+  }
+
+  if (withDist.length < 2) return null;
+  const totalDist = withDist[withDist.length - 1].dist;
+  if (!totalDist || totalDist < 500) return null; // too short for splits
+
+  const splitMeters = 1000;
+  const numSplits = Math.ceil(totalDist / splitMeters);
+  const splits = [];
+
+  for (let km = 0; km < numSplits; km++) {
+    const startDist = km * splitMeters;
+    const endDist = Math.min((km + 1) * splitMeters, totalDist);
+    const inSplit = withDist.filter(s => s.dist >= startDist && s.dist < endDist);
+    if (inSplit.length < 2) continue;
+
+    const tStart = inSplit[0].t;
+    const tEnd = inSplit[inSplit.length - 1].t;
+    const distCovered = endDist - startDist;
+    const timeSec = tEnd - tStart;
+    if (timeSec <= 0) continue;
+
+    // pace in sec per km (normalize to full km)
+    const paceSecPerKm = (timeSec / distCovered) * 1000;
+
+    const hrs = inSplit.filter(s => s.h !== null && s.h !== undefined).map(s => s.h);
+    const cads = inSplit.filter(s => s.c !== null && s.c !== undefined && s.c > 0).map(s => s.c);
+
+    splits.push({
+      km: km + 1,
+      partial: endDist - startDist < splitMeters,
+      distanceM: Math.round(distCovered),
+      paceSecPerKm: Math.round(paceSecPerKm),
+      avgHR: hrs.length ? Math.round(hrs.reduce((a,b)=>a+b,0)/hrs.length) : null,
+      avgCadence: cads.length ? Math.round(cads.reduce((a,b)=>a+b,0)/cads.length) : null,
+    });
+  }
+
+  return splits.length > 0 ? splits : null;
+}
+
+// HR drift over time — returns downsampled series for charting {t (min), hr, pace}
+function computeHRDriftSeries(activity) {
+  if (!activity.samples || activity.samples.length < 5) return null;
+  const samples = activity.samples.filter(s => s.h !== null && s.h !== undefined && s.h > 0);
+  if (samples.length < 10) return null;
+
+  // Downsample to ~80 points for a clean chart
+  const target = 80;
+  const stride = Math.max(1, Math.floor(samples.length / target));
+  const series = [];
+  for (let i = 0; i < samples.length; i += stride) {
+    const s = samples[i];
+    series.push({
+      min: Math.round(s.t / 60 * 10) / 10,
+      hr: s.h,
+      cadence: (s.c !== null && s.c !== undefined && s.c > 0) ? s.c : null,
+    });
+  }
+  return series;
+}
+
 // ============================================================
 // Parsers
 // ============================================================
@@ -553,14 +710,48 @@ function parseTCX(text) {
         if (v >= 0) { power = v; break; }
       }
 
-      samples.push({ t: elapsed, hr, power, distance: dist });
+      // GPS coordinates (cycling/running outdoor)
+      const posEl = tps[k].getElementsByTagName('Position')[0];
+      let lat = null, lon = null;
+      if (posEl) {
+        const latEl = posEl.getElementsByTagName('LatitudeDegrees')[0];
+        const lonEl = posEl.getElementsByTagName('LongitudeDegrees')[0];
+        if (latEl) lat = parseFloat(latEl.textContent);
+        if (lonEl) lon = parseFloat(lonEl.textContent);
+        if (!isFinite(lat) || !isFinite(lon)) { lat = null; lon = null; }
+      }
+
+      // Cadence — Garmin stores RunCadence (per-leg spm, ×2 for full) in extensions,
+      // or <Cadence> element (bike rpm). We capture both, doubling run cadence.
+      let cadence = null;
+      const cadEl = tps[k].getElementsByTagName('Cadence')[0];
+      if (cadEl) {
+        const v = parseFloat(cadEl.textContent);
+        if (v >= 0) cadence = v;
+      }
+      // Look for RunCadence in any extension element (namespaced, so match by suffix)
+      const extEl = tps[k].getElementsByTagName('Extensions')[0];
+      if (extEl) {
+        const all = extEl.getElementsByTagName('*');
+        for (let q = 0; q < all.length; q++) {
+          const tag = all[q].tagName.toLowerCase();
+          if (tag.endsWith('runcadence')) {
+            const v = parseFloat(all[q].textContent);
+            if (v > 0) { cadence = v * 2; break; } // per-leg → full spm
+          }
+        }
+      }
+
+      samples.push({ t: elapsed, hr, power, distance: dist, lat, lon, cadence });
     }
 
     const hrV = samples.filter(s => s.hr !== null).map(s => s.hr);
     const pwV = samples.filter(s => s.power !== null).map(s => s.power);
+    const cadV = samples.filter(s => s.cadence !== null && s.cadence > 0).map(s => s.cadence);
     const avgHR = hrV.length ? Math.round(hrV.reduce((a,b)=>a+b,0)/hrV.length) : null;
     const maxHR = hrV.length ? Math.max(...hrV) : null;
     const avgPower = pwV.length ? Math.round(pwV.reduce((a,b)=>a+b,0)/pwV.length) : null;
+    const avgCadence = cadV.length ? Math.round(cadV.reduce((a,b)=>a+b,0)/cadV.length) : null;
 
     let np = null;
     if (pwV.length > 30) {
@@ -627,6 +818,11 @@ function parseTCX(text) {
           t: Math.round(s.t),
           h: s.hr !== null ? s.hr : null,
           p: s.power !== null ? s.power : null,
+          c: s.cadence !== null ? Math.round(s.cadence) : null,
+          d: s.distance !== null && s.distance !== undefined ? Math.round(s.distance) : null,
+          // GPS — only if present, rounded to 6 decimals (~10cm precision is enough)
+          la: s.lat !== null ? Math.round(s.lat * 1000000) / 1000000 : null,
+          lo: s.lon !== null ? Math.round(s.lon * 1000000) / 1000000 : null,
         });
       }
     }
@@ -636,9 +832,10 @@ function parseTCX(text) {
       date: dateISO, sport,
       durationSec: Math.round(totalTime),
       distanceM: Math.round(totalDist),
-      avgHR, maxHR, avgPower, normalizedPower: np,
+      avgHR, maxHR, avgPower, normalizedPower: np, avgCadence,
       decoupling,
       samples: compactSamples,
+      nutrition: [],
       source: 'tcx', name: '',
     });
   }
@@ -668,6 +865,8 @@ function parseGPX(text) {
 
     let dist = 0, prevLat = null, prevLon = null;
     const hrV = [];
+    const gpsPoints = []; // {t, la, lo, h}
+    const startMs = firstTime ? new Date(firstTime).getTime() : null;
     for (let p = 0; p < pts.length; p++) {
       const lat = parseFloat(pts[p].getAttribute('lat'));
       const lon = parseFloat(pts[p].getAttribute('lon'));
@@ -679,17 +878,38 @@ function parseGPX(text) {
         dist += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
       }
       prevLat = lat; prevLon = lon;
+      let ptHr = null;
       const ext = pts[p].getElementsByTagName('extensions')[0];
       if (ext) {
         const all = ext.getElementsByTagName('*');
         for (let g = 0; g < all.length; g++) {
           if (all[g].tagName.toLowerCase().endsWith('hr')) {
             const v = parseFloat(all[g].textContent);
-            if (v > 0) hrV.push(v);
+            if (v > 0) { hrV.push(v); ptHr = v; }
           }
         }
       }
+      const tStr = pts[p].getElementsByTagName('time')[0]?.textContent;
+      const tElapsed = (tStr && startMs !== null) ? (new Date(tStr).getTime() - startMs) / 1000 : p;
+      gpsPoints.push({ t: Math.round(tElapsed), la: lat, lo: lon, h: ptHr, p: null });
     }
+    // Compress samples — keep every Nth point, max ~720
+    let compactSamples = null;
+    if (gpsPoints.length > 0) {
+      const stride = Math.max(1, Math.floor(gpsPoints.length / 720));
+      compactSamples = [];
+      for (let k = 0; k < gpsPoints.length; k += stride) {
+        const g = gpsPoints[k];
+        compactSamples.push({
+          t: g.t,
+          h: g.h,
+          p: null,
+          la: Math.round(g.la * 1000000) / 1000000,
+          lo: Math.round(g.lo * 1000000) / 1000000,
+        });
+      }
+    }
+
     out.push({
       id: `gpx_${firstTime}_${t}`,
       date: firstTime || new Date().toISOString(),
@@ -699,6 +919,7 @@ function parseGPX(text) {
       avgHR: hrV.length ? Math.round(hrV.reduce((a,b)=>a+b,0)/hrV.length) : null,
       maxHR: hrV.length ? Math.max(...hrV) : null,
       avgPower: null, normalizedPower: null,
+      samples: compactSamples,
       source: 'gpx', name,
     });
   }
@@ -834,18 +1055,61 @@ function Input({ value, onChange, type = 'text', placeholder, suffix, style = {}
   );
 }
 
-function KPI({ label, value, unit, sub, color = C.text, accent }) {
+function KPI({ label, value, unit, sub, color, accent }) {
+  const c = color || C.text;
   return (
     <Card>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12, alignItems: 'center' }}>
         <div className="mono" style={{ fontSize: 10, color: C.muted, letterSpacing: '0.12em', textTransform: 'uppercase' }}>{label}</div>
-        {accent && <div style={{ width: 8, height: 8, borderRadius: '50%', background: accent }} />}
+        {accent && <div style={{ width: 8, height: 8, borderRadius: '50%', background: accent, boxShadow: `0 0 8px ${accent}80` }} />}
       </div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
-        <div className="mono" style={{ fontSize: 36, fontWeight: 500, color, letterSpacing: '-0.02em', lineHeight: 1 }}>{value}</div>
-        {unit && <div className="mono" style={{ fontSize: 13, color: C.muted }}>{unit}</div>}
+        <div
+          className="mono"
+          style={{
+            fontSize: 42, fontWeight: 600, letterSpacing: '-0.03em', lineHeight: 1,
+            background: accent ? `linear-gradient(180deg, ${c} 0%, ${accent} 100%)` : c,
+            WebkitBackgroundClip: accent ? 'text' : undefined,
+            WebkitTextFillColor: accent ? 'transparent' : undefined,
+            backgroundClip: accent ? 'text' : undefined,
+            color: accent ? 'transparent' : c,
+          }}
+        >{value}</div>
+        {unit && <div className="mono" style={{ fontSize: 12, color: C.muted }}>{unit}</div>}
       </div>
       {sub && <div style={{ fontSize: 12, color: C.textDim, marginTop: 8 }}>{sub}</div>}
+    </Card>
+  );
+}
+
+// Ring chart KPI — circular progress with number inside (TrainX style)
+function RingKPI({ label, value, unit, sub, max = 100, accent, size = 110, strokeWidth = 8 }) {
+  const c = accent || C.lime;
+  const numeric = typeof value === 'number' ? value : parseFloat(String(value).replace(/[^\d.-]/g, '')) || 0;
+  const pct = Math.max(0, Math.min(1, Math.abs(numeric) / max));
+  const radius = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference * (1 - pct);
+
+  return (
+    <Card>
+      <div className="mono" style={{ fontSize: 10, color: C.muted, letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 12 }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
+        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ transform: 'rotate(-90deg)' }}>
+          <circle cx={size/2} cy={size/2} r={radius} fill="none" stroke={C.surfaceAlt} strokeWidth={strokeWidth} />
+          <circle
+            cx={size/2} cy={size/2} r={radius} fill="none"
+            stroke={c} strokeWidth={strokeWidth} strokeLinecap="round"
+            strokeDasharray={circumference} strokeDashoffset={offset}
+            style={{ filter: `drop-shadow(0 0 6px ${c}80)`, transition: 'stroke-dashoffset 0.5s ease-out' }}
+          />
+        </svg>
+        <div style={{ position: 'absolute', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+          <div className="mono" style={{ fontSize: 24, fontWeight: 600, color: c, lineHeight: 1, letterSpacing: '-0.02em' }}>{value}</div>
+          {unit && <div className="mono" style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{unit}</div>}
+        </div>
+      </div>
+      {sub && <div style={{ fontSize: 12, color: C.textDim, marginTop: 12, textAlign: 'center' }}>{sub}</div>}
     </Card>
   );
 }
@@ -959,12 +1223,12 @@ function EmptyState({ onImport, importStatus }) {
 // ============================================================
 // Activity row
 // ============================================================
-function ActivityRow({ a, onDelete, onEdit, editable, analyzable, analysis, analyzing, onAnalyze, onClearAnalysis, settings, onUpdateRPE }) {
+function ActivityRow({ a, onDelete, onEdit, editable, analyzable, analysis, analyzing, onAnalyze, onClearAnalysis, settings, onUpdateRPE, onUpdateNutrition }) {
   const [expanded, setExpanded] = useState(false);
   const Icon = SPORT_META[a.sport].icon;
   const color = SPORT_META[a.sport].color;
   const editCol = editable && onEdit ? ' 24px' : '';
-  const hasDetails = a.samples && a.samples.length > 5;
+  const hasDetails = true; // RPE picker always available; charts/map shown if data exists
   const expandCol = hasDetails ? ' 24px' : '';
   const gridCols = '32px 1fr 90px 70px 70px 70px 60px' + expandCol + (analyzable ? ' 24px' : '') + editCol + (editable ? ' 24px' : '');
 
@@ -987,6 +1251,8 @@ function ActivityRow({ a, onDelete, onEdit, editable, analyzable, analysis, anal
             {a.name || SPORT_META[a.sport].label}
             {a.source === 'manual' && <span className="mono" style={{ marginLeft: 8, fontSize: 9, padding: '1px 6px', background: C.borderAlt, color: C.muted, borderRadius: 99, letterSpacing: '0.1em' }}>MANUAL</span>}
             {a.rpe && <span className="mono" style={{ marginLeft: 8, fontSize: 9, padding: '1px 6px', background: C.lime + '20', color: C.lime, borderRadius: 99, letterSpacing: '0.05em', fontWeight: 600 }}>RPE {a.rpe}</span>}
+            {a.nutrition && a.nutrition.length > 0 && <span className="mono" style={{ marginLeft: 6, fontSize: 9, padding: '1px 6px', background: C.amber + '20', color: C.amber, borderRadius: 99, fontWeight: 600 }}>⚡ {a.nutrition.length}</span>}
+            {a.avgCadence && a.sport === 'running' && <span className="mono" style={{ marginLeft: 6, fontSize: 9, padding: '1px 6px', background: (a.avgCadence < 175 ? C.amber : C.cyan) + '20', color: a.avgCadence < 175 ? C.amber : C.cyan, borderRadius: 99, fontWeight: 600 }}>{a.avgCadence} spm</span>}
           </div>
           <div className="mono" style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
             {fmtDateFull(a.date)}
@@ -1077,6 +1343,12 @@ function ActivityRow({ a, onDelete, onEdit, editable, analyzable, analysis, anal
           {onUpdateRPE && (
             <RPEPicker activity={a} onChange={(v) => onUpdateRPE(a.id, v)} />
           )}
+          {onUpdateNutrition && (
+            <NutritionLog activity={a} onChange={(list) => onUpdateNutrition(a.id, list)} />
+          )}
+          <SplitsTable activity={a} />
+          <HRDriftChart activity={a} />
+          <MapView activity={a} />
           {a.sport === 'cycling' && a.samples?.some(s => s.p) && (
             <PowerDurationCurveChart activity={a} />
           )}
@@ -1087,7 +1359,7 @@ function ActivityRow({ a, onDelete, onEdit, editable, analyzable, analysis, anal
   );
 }
 
-function ActivityList({ activities, onDelete, onEdit, editable, analyzable, analyses, analyzingIds, onAnalyze, onClearAnalysis, settings, onUpdateRPE }) {
+function ActivityList({ activities, onDelete, onEdit, editable, analyzable, analyses, analyzingIds, onAnalyze, onClearAnalysis, settings, onUpdateRPE, onUpdateNutrition }) {
   if (activities.length === 0) {
     return <div style={{ color: C.muted, textAlign: 'center', padding: 32, fontSize: 13 }}>Brak aktywności</div>;
   }
@@ -1126,6 +1398,7 @@ function ActivityList({ activities, onDelete, onEdit, editable, analyzable, anal
           onClearAnalysis={onClearAnalysis}
           settings={settings}
           onUpdateRPE={onUpdateRPE}
+          onUpdateNutrition={onUpdateNutrition}
         />
       ))}
     </div>
@@ -1502,11 +1775,11 @@ function Dashboard({ activities, pmcData, today, settings, onImport, importStatu
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <TodayCard unit={todayPlanUnit} today={today} daysToRace={daysToRace} onSkip={onSkip} onUnskip={onUnskip} settings={settings} onMarkStrength={onMarkStrength} onAddManual={onAddManual} onOpenVoice={onOpenVoice} matchedActivity={todayPlanUnit?.matchedActivity} />
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
-        <KPI label="CTL · Fitness" value={Math.round(today.ctl)} unit="TSS/d" sub="42-dniowa średnia" accent={C.lime} />
-        <KPI label="ATL · Zmęczenie" value={Math.round(today.atl)} unit="TSS/d" sub="7-dniowa średnia" accent={C.red} />
-        <KPI label="TSB · Forma" value={today.tsb > 0 ? `+${Math.round(today.tsb)}` : Math.round(today.tsb)} sub={formLabel} color={formColor} accent={formColor} />
-        <KPI label="7-dni TSS" value={last7TSS} sub={`${last7H.toFixed(1)} h · ${last7.length} sesji`} />
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 16 }}>
+        <RingKPI label="CTL · Fitness" value={Math.round(today.ctl)} unit="TSS/d" sub="42-dniowa średnia" accent={C.lime} max={120} />
+        <RingKPI label="ATL · Zmęczenie" value={Math.round(today.atl)} unit="TSS/d" sub="7-dniowa średnia" accent={C.red} max={120} />
+        <RingKPI label="TSB · Forma" value={today.tsb > 0 ? `+${Math.round(today.tsb)}` : Math.round(today.tsb)} sub={formLabel} accent={formColor} max={40} />
+        <RingKPI label="7-dni TSS" value={last7TSS} sub={`${last7H.toFixed(1)} h · ${last7.length} sesji`} accent={C.cyan} max={700} />
       </div>
 
       <CTLPerSportCard activities={activities} />
@@ -1621,7 +1894,7 @@ function makeManualActivity({ date, sport, durationMin, distanceKm, avgHR, tss, 
   };
 }
 
-function VoiceJournalModal({ onClose, onSave, activity, unit, settings, activities, pmcData, planOverrides, setPlanOverrides }) {
+function VoiceJournalModal({ onClose, onSave, activity, unit, settings, activities, pmcData, planOverrides, setPlanOverrides, recovery }) {
   const [text, setText] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [analysis, setAnalysis] = useState(null);
@@ -1647,7 +1920,7 @@ function VoiceJournalModal({ onClose, onSave, activity, unit, settings, activiti
     setIsProcessing(true);
     setError(null);
 
-    const context = buildContext(activities, pmcData, settings);
+    const context = buildContext(activities, pmcData, settings, recovery);
     const activityInfo = activity ? `
 DZISIEJSZY TRENING (zrobiony):
 - Sport: ${SPORT_META[activity.sport].label}
@@ -2118,7 +2391,7 @@ function WorkoutFormModal({ onClose, onSave, settings, editing, defaultDate }) {
   );
 }
 
-function Activities({ activities, setActivities, pmcData, settings }) {
+function Activities({ activities, setActivities, pmcData, settings, recovery }) {
   const [filter, setFilter] = useState('all');
   const [analyses, setAnalyses] = useState({});
   const [analyzingIds, setAnalyzingIds] = useState(new Set());
@@ -2165,28 +2438,73 @@ function Activities({ activities, setActivities, pmcData, settings }) {
     setActivities(prev => prev.map(a => a.id === id ? { ...a, rpe } : a));
   };
 
+  const onUpdateNutrition = (id, nutrition) => {
+    setActivities(prev => prev.map(a => a.id === id ? { ...a, nutrition } : a));
+  };
+
   const onAnalyze = async (activity) => {
     setError(null);
     setAnalyzingIds(prev => new Set(prev).add(activity.id));
 
-    const context = buildContext(activities, pmcData, settings);
+    const context = buildContext(activities, pmcData, settings, recovery);
     const sportLabel = SPORT_META[activity.sport].label;
+
+    // Splits per km
+    const splits = computeSplits(activity);
+    let splitsBlock = '';
+    if (splits && splits.length > 0) {
+      const fmtP = (sec) => `${Math.floor(sec/60)}:${String(Math.round(sec%60)).padStart(2,'0')}`;
+      splitsBlock = '\n\nSPLITY PER KILOMETR:\n' + splits.map(s => {
+        const paceStr = activity.sport === 'running'
+          ? `${fmtP(s.paceSecPerKm)}/km`
+          : `${(3600/s.paceSecPerKm).toFixed(1)} km/h`;
+        return `KM ${s.km}${s.partial ? ' (część)' : ''}: ${paceStr}` +
+          `${s.avgHR ? `, HR ${s.avgHR} bpm` : ''}` +
+          `${s.avgCadence ? `, kadencja ${s.avgCadence} spm` : ''}`;
+      }).join('\n');
+    }
+
+    // HR drift summary
+    const driftSeries = computeHRDriftSeries(activity);
+    let driftBlock = '';
+    if (driftSeries && driftSeries.length > 4) {
+      const firstQ = driftSeries.slice(0, Math.floor(driftSeries.length / 4));
+      const lastQ = driftSeries.slice(-Math.floor(driftSeries.length / 4));
+      const avgFirst = Math.round(firstQ.reduce((a,b)=>a+b.hr,0) / firstQ.length);
+      const avgLast = Math.round(lastQ.reduce((a,b)=>a+b.hr,0) / lastQ.length);
+      driftBlock = `\n\nDRYF TĘTNA: pierwsza ćwiartka treningu śr. HR ${avgFirst} bpm → ostatnia ćwiartka śr. HR ${avgLast} bpm (różnica ${avgLast - avgFirst > 0 ? '+' : ''}${avgLast - avgFirst} bpm).`;
+    }
+
+    // Nutrition
+    let nutritionBlock = '';
+    if (activity.nutrition && activity.nutrition.length > 0) {
+      nutritionBlock = '\n\nŻYWIENIE PODCZAS TRENINGU:\n' + activity.nutrition.map(n =>
+        `${n.timeMin !== null ? `${n.timeMin} min` : 'przed startem'}: ${n.product}`
+      ).join('\n');
+    }
+
     const actLine = `Data: ${fmtDateFull(activity.date)}
 Sport: ${sportLabel}
 Czas: ${fmtDur(activity.durationSec)}
 Dystans: ${fmtDist(activity.distanceM)}
 HR średnie: ${activity.avgHR || '–'} bpm
 HR max: ${activity.maxHR || '–'} bpm
+Kadencja średnia: ${activity.avgCadence ? activity.avgCadence + ' spm' : '–'}
 Moc średnia: ${activity.avgPower ? activity.avgPower + ' W' : '–'}
 Normalized Power: ${activity.normalizedPower ? activity.normalizedPower + ' W' : '–'}
-TSS: ${activity.tss}${activity.decoupling !== null && activity.decoupling !== undefined ? `
-Decoupling (aerobic drift): ${activity.decoupling > 0 ? '+' : ''}${activity.decoupling.toFixed(1)}% (>10% = drift, <5% = świetnie)` : ''}`;
+TSS: ${activity.tss}${activity.rpe ? `\nRPE (odczucie): ${activity.rpe}/10` : ''}${activity.decoupling !== null && activity.decoupling !== undefined ? `
+Decoupling (aerobic drift): ${activity.decoupling > 0 ? '+' : ''}${activity.decoupling.toFixed(1)}% (>10% = drift, <5% = świetnie)` : ''}${splitsBlock}${driftBlock}${nutritionBlock}`;
 
-    const system = `Jesteś ekspertem od treningu wytrzymałościowego analizującym JEDEN trening.
-Wyciągnij JEDNĄ konkretną obserwację w 1-2 zdaniach po polsku.
-Używaj liczb (HR, moc, TSS, czas, tempo, dystans). Odnoś się do profilu zawodnika i fazy makrocyklu.
-Bez wstępów typu "Świetny trening!" — od razu do meritum. Bez znaczników markdown.
-Jeśli widzisz coś niepokojącego (przeciążenie, niepokojące tętno, niezgodność z regułami) — zaznacz to wprost.
+    const system = `Jesteś ekspertem od treningu wytrzymałościowego analizującym JEDEN trening triathlonisty-amatora.
+
+Przeanalizuj trening WIELOWYMIAROWO (3-5 zdań, po polsku, bez markdown):
+1. TEMPO/SPLITY: czy tempo było równe? Pozytywny/negatywny split? Gdzie zwolnił/przyspieszył?
+2. TĘTNO: jak się zmieniało? Dryf HR przy stałym tempie = zmęczenie/odwodnienie/ciepło. Skok HR po żelu z kofeiną to normalne (kofeina podnosi HR o 3-8 bpm) i NIE oznacza gorszego treningu jeśli tempo się trzymało.
+3. KADENCJA (bieg): cel zawodnika to min. 178 spm dla ochrony L4-L5 i prawego kolana. Jeśli niżej — zaznacz to.
+4. ŻYWIENIE: jeśli podano żele/kofeinę/izotonik — skomentuj timing i wpływ. Powiąż przyjęcie z reakcją tętna jeśli widać zależność czasową.
+5. WERDYKT: czy trening spełnił cel? Odnieś się do fazy makrocyklu i reguł.
+
+Bądź konkretny, używaj liczb. Bez wstępów typu "Świetny trening!". Jeśli widzisz coś niepokojącego (przeciążenie, kadencja za niska, niezgodność z regułami, niepokojące tętno) — powiedz wprost.
 
 KONTEKST ZAWODNIKA:
 ${context}
@@ -2197,9 +2515,9 @@ ${actLine}`;
     try {
       const data = await callClaude({
         model: "claude-sonnet-4-6",
-        max_tokens: 300,
+        max_tokens: 600,
         system,
-        messages: [{ role: 'user', content: 'Wyciągnij jeden kluczowy sygnał z tego treningu.' }],
+        messages: [{ role: 'user', content: 'Przeanalizuj ten trening wielowymiarowo: tempo, tętno, kadencja, żywienie, werdykt.' }],
       });
       const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
       const next = { ...analyses, [activity.id]: { text, generatedAt: new Date().toISOString() } };
@@ -2279,6 +2597,7 @@ ${actLine}`;
         onClearAnalysis={onClearAnalysis}
         settings={settings}
         onUpdateRPE={onUpdateRPE}
+        onUpdateNutrition={onUpdateNutrition}
       />
     </Card>
   );
@@ -2287,7 +2606,7 @@ ${actLine}`;
 // ============================================================
 // AI Coach
 // ============================================================
-function buildContext(activities, pmcData, settings) {
+function buildContext(activities, pmcData, settings, recovery = []) {
   const today = pmcData[pmcData.length-1] || { ctl: 0, atl: 0, tsb: 0 };
   const last14 = activities.filter(a => new Date(a.date).getTime() > Date.now() - 14*24*3600*1000)
     .sort((a,b) => new Date(b.date) - new Date(a.date));
@@ -2307,6 +2626,17 @@ function buildContext(activities, pmcData, settings) {
     `${a.date.slice(0,10)} · ${SPORT_META[a.sport].short} · ${fmtDur(a.durationSec)} · ${fmtDist(a.distanceM)} · HR ${a.avgHR || '–'} · NP ${a.normalizedPower || '–'}W · TSS ${a.tss}`
   ).join('\n');
 
+  // Recovery — last 30 days of physio/rolling/etc
+  const recentRecovery = (recovery || [])
+    .filter(r => new Date(r.date).getTime() > Date.now() - 30*24*3600*1000)
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
+  const recoveryBlock = recentRecovery.length > 0
+    ? recentRecovery.map(r => {
+        const label = (RECOVERY_TYPES[r.type] || {}).label || r.type;
+        return `${r.date.slice(0,10)} · ${label}${r.areas ? ` · ${r.areas}` : ''}${r.notes ? ` — ${r.notes}` : ''}`;
+      }).join('\n')
+    : 'brak wpisów';
+
   return `${settings.rules && settings.rules.length > 0 ? `TWARDE REGUŁY (zawsze przestrzegaj — to są nadrzędne ograniczenia coachingu):\n${settings.rules.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n\n` : ''}${settings.profile ? `PROFIL SPORTOWCA (bardzo ważny kontekst — zawsze uwzględniaj):\n${settings.profile}\n\n` : ''}DANE LICZBOWE:
 - Główny sport: ${SPORT_META[settings.primarySport].label}
 - FTP: ${settings.ftp} W
@@ -2325,10 +2655,13 @@ TSS tygodniowy (ostatnie 8 tygodni):
 ${weekly || 'brak danych'}
 
 Ostatnie 14 dni aktywności:
-${acts || 'brak'}`;
+${acts || 'brak'}
+
+REGENERACJA / FIZJOTERAPIA (ostatnie 30 dni — KRYTYCZNE dla planowania, uwzględnij zalecenia fizjo):
+${recoveryBlock}`;
 }
 
-function Coach({ activities, pmcData, settings, history, setHistory }) {
+function Coach({ activities, pmcData, settings, history, setHistory, recovery }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const endRef = useRef(null);
@@ -2344,7 +2677,7 @@ function Coach({ activities, pmcData, settings, history, setHistory }) {
     setInput('');
     setLoading(true);
 
-    const context = buildContext(activities, pmcData, settings);
+    const context = buildContext(activities, pmcData, settings, recovery);
     const system = `Jesteś ekspertem od treningu wytrzymałościowego (kolarstwo, bieganie, triathlon).
 Analizujesz dane sportowca i odpowiadasz konkretnie po polsku.
 Używaj liczb (TSS, CTL, ATL, TSB, godziny, watty, tempo). Bądź zwięzły ale merytoryczny.
@@ -3566,7 +3899,7 @@ function downloadICS(planUnits, settings) {
 }
 
 
-function DayCell({ unit, onClick, isSelected }) {
+function DayCell({ unit, onClick, isSelected, recoveryItems = [] }) {
   const isRest = unit.sport === 'rest';
   const isRace = unit.sport === 'race';
   const SportIcon = isRace ? Target : (SPORT_META[unit.sport]?.icon || null);
@@ -3629,6 +3962,19 @@ function DayCell({ unit, onClick, isSelected }) {
       {structure.length > 0 && (
         <div style={{ marginTop: 6 }}>
           <WorkoutStructure structure={structure} height={6} />
+        </div>
+      )}
+      {recoveryItems.length > 0 && (
+        <div style={{ display: 'flex', gap: 3, marginTop: 6, flexWrap: 'wrap' }}>
+          {recoveryItems.map((r, i) => {
+            const rm = RECOVERY_TYPES[r.type] || RECOVERY_TYPES.rolling;
+            return (
+              <span key={i} title={`${rm.label}${r.areas ? ' · ' + r.areas : ''}`} style={{
+                fontSize: 9, lineHeight: 1, padding: '2px 4px', borderRadius: 4,
+                background: rm.color + '22', color: rm.color, fontWeight: 600,
+              }}>{rm.icon}</span>
+            );
+          })}
         </div>
       )}
     </button>
@@ -3976,6 +4322,331 @@ function RPEPicker({ activity, onChange }) {
       {current && (
         <div className="mono" style={{ fontSize: 11, color: colorFor(current), textAlign: 'center', letterSpacing: '0.05em' }}>
           {current}/10 · {rpeLabels[current]}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function SplitsTable({ activity }) {
+  const splits = useMemo(() => computeSplits(activity), [activity]);
+  if (!splits || splits.length === 0) return null;
+
+  const fmtPace = (sec) => {
+    if (!sec || !isFinite(sec)) return '–';
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return `${m}:${String(s).padStart(2, '0')}`;
+  };
+
+  const isRun = activity.sport === 'running';
+  const unit = isRun ? '/km' : 'km/h';
+
+  // For cycling show speed instead of pace
+  const displayPace = (s) => {
+    if (isRun) return fmtPace(s.paceSecPerKm);
+    const kmh = s.paceSecPerKm > 0 ? (3600 / s.paceSecPerKm) : 0;
+    return kmh.toFixed(1);
+  };
+
+  // Find fastest/slowest for highlighting
+  const paces = splits.filter(s => !s.partial).map(s => s.paceSecPerKm);
+  const fastest = Math.min(...paces);
+  const slowest = Math.max(...paces);
+
+  // HR range for color coding
+  const hrs = splits.filter(s => s.avgHR).map(s => s.avgHR);
+  const minHR = hrs.length ? Math.min(...hrs) : 0;
+  const maxHR = hrs.length ? Math.max(...hrs) : 0;
+
+  return (
+    <Card>
+      <SectionLabel>Splity · {isRun ? 'tempo per km' : 'prędkość per km'}</SectionLabel>
+      <div style={{ marginTop: 12, overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+          <thead>
+            <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+              <th style={{ textAlign: 'left', padding: '6px 8px', color: C.muted, fontWeight: 500 }}>KM</th>
+              <th style={{ textAlign: 'right', padding: '6px 8px', color: C.muted, fontWeight: 500 }}>{isRun ? 'Tempo' : 'Prędkość'}</th>
+              <th style={{ textAlign: 'right', padding: '6px 8px', color: C.muted, fontWeight: 500 }}>Tętno</th>
+              <th style={{ textAlign: 'right', padding: '6px 8px', color: C.muted, fontWeight: 500 }}>Kadencja</th>
+              <th style={{ width: '30%', padding: '6px 8px' }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {splits.map(s => {
+              const isFast = !s.partial && s.paceSecPerKm === fastest;
+              const isSlow = !s.partial && s.paceSecPerKm === slowest && splits.length > 1;
+              // bar width by inverse pace (faster = longer bar) for run, direct for bike
+              const barPct = paces.length > 1
+                ? (isRun
+                    ? ((slowest - s.paceSecPerKm) / (slowest - fastest || 1)) * 100
+                    : ((s.paceSecPerKm === 0 ? 0 : (slowest - s.paceSecPerKm) / (slowest - fastest || 1)) * 100))
+                : 50;
+              return (
+                <tr key={s.km} style={{ borderBottom: `1px solid ${C.border}40` }}>
+                  <td className="mono" style={{ padding: '6px 8px', color: C.textDim }}>
+                    {s.km}{s.partial ? <span style={{ color: C.muted, fontSize: 10 }}> ({(s.distanceM/1000).toFixed(2)})</span> : ''}
+                  </td>
+                  <td className="mono" style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 600,
+                    color: isFast ? C.lime : isSlow ? C.amber : C.text }}>
+                    {displayPace(s)}<span style={{ fontSize: 9, color: C.muted, fontWeight: 400 }}> {unit}</span>
+                  </td>
+                  <td className="mono" style={{ padding: '6px 8px', textAlign: 'right', color: s.avgHR ? C.cyan : C.muted }}>
+                    {s.avgHR ? `${s.avgHR}` : '–'}
+                  </td>
+                  <td className="mono" style={{ padding: '6px 8px', textAlign: 'right',
+                    color: s.avgCadence ? (isRun && s.avgCadence < 175 ? C.amber : C.textDim) : C.muted }}>
+                    {s.avgCadence ? `${s.avgCadence}` : '–'}
+                  </td>
+                  <td style={{ padding: '6px 8px' }}>
+                    <div style={{ height: 5, background: C.surfaceAlt, borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ width: `${Math.max(4, barPct)}%`, height: '100%',
+                        background: isFast ? C.lime : isSlow ? C.amber : C.cyan, borderRadius: 3 }} />
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {isRun && splits.some(s => s.avgCadence && s.avgCadence < 175) && (
+        <div style={{ marginTop: 10, fontSize: 11, color: C.amber, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <AlertCircle size={12} /> Kadencja poniżej 175 spm na niektórych km — pamiętaj o krótkim, szybkim kroku (cel 178+) dla ochrony L4-L5.
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function HRDriftChart({ activity }) {
+  const series = useMemo(() => computeHRDriftSeries(activity), [activity]);
+  if (!series || series.length < 5) return null;
+
+  const hrs = series.map(s => s.hr);
+  const minHR = Math.min(...hrs);
+  const maxHR = Math.max(...hrs);
+  const hasCadence = series.some(s => s.cadence !== null);
+
+  return (
+    <Card>
+      <SectionLabel>Tętno w czasie {hasCadence ? '+ kadencja' : ''}</SectionLabel>
+      <div style={{ fontSize: 12, color: C.textDim, marginTop: 6, marginBottom: 12 }}>
+        Jak HR zmieniał się przez trening. Wzrost przy stałym tempie = zmęczenie, odwodnienie lub żel/kofeina.
+      </div>
+      <div style={{ height: 200, width: '100%' }}>
+        <ResponsiveContainer>
+          <LineChart data={series} margin={{ top: 5, right: 8, left: -10, bottom: 5 }}>
+            <CartesianGrid stroke={C.border} strokeDasharray="2 4" vertical={false} />
+            <XAxis dataKey="min" stroke={C.muted} tick={{ fontSize: 10, fill: C.muted }}
+              tickFormatter={(v) => `${Math.round(v)}'`} tickLine={false} axisLine={{ stroke: C.border }} />
+            <YAxis yAxisId="hr" domain={[minHR - 5, maxHR + 5]} stroke={C.muted}
+              tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={{ stroke: C.border }} width={36} />
+            {hasCadence && (
+              <YAxis yAxisId="cad" orientation="right" domain={[150, 200]} stroke={C.muted}
+                tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={{ stroke: C.border }} width={32} />
+            )}
+            <Tooltip contentStyle={{ background: C.surface, border: `1px solid ${C.borderAlt}`, borderRadius: 8, fontSize: 12 }}
+              labelStyle={{ color: C.textDim }} labelFormatter={(v) => `${v} min`}
+              formatter={(val, name) => [val, name === 'hr' ? 'Tętno (bpm)' : 'Kadencja (spm)']} />
+            <Line yAxisId="hr" type="monotone" dataKey="hr" stroke={C.cyan} strokeWidth={2} dot={false} name="hr" />
+            {hasCadence && (
+              <Line yAxisId="cad" type="monotone" dataKey="cadence" stroke={C.lime} strokeWidth={1.5} dot={false}
+                strokeDasharray="3 3" name="cadence" connectNulls />
+            )}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </Card>
+  );
+}
+
+const NUTRITION_PRESETS = [
+  'Żel energetyczny',
+  'Żel z kofeiną',
+  'Baton energetyczny',
+  'Izotonik',
+  'Woda',
+  'Sok z buraka (przed)',
+  'Kofeina (przed)',
+  'Banan',
+  'Sól / elektrolity',
+];
+
+function NutritionLog({ activity, onChange }) {
+  const items = activity.nutrition || [];
+  const [adding, setAdding] = useState(false);
+  const [product, setProduct] = useState(NUTRITION_PRESETS[0]);
+  const [customProduct, setCustomProduct] = useState('');
+  const [timeMin, setTimeMin] = useState('');
+
+  const durationMin = activity.durationSec ? Math.round(activity.durationSec / 60) : null;
+
+  const addItem = () => {
+    const name = product === '__custom__' ? customProduct.trim() : product;
+    if (!name) return;
+    const entry = {
+      id: Date.now(),
+      product: name,
+      timeMin: timeMin === '' ? null : Number(timeMin),
+    };
+    onChange([...items, entry].sort((a, b) => (a.timeMin ?? 9999) - (b.timeMin ?? 9999)));
+    setAdding(false);
+    setProduct(NUTRITION_PRESETS[0]);
+    setCustomProduct('');
+    setTimeMin('');
+  };
+
+  const removeItem = (id) => onChange(items.filter(i => i.id !== id));
+
+  return (
+    <Card>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+        <SectionLabel>Żywienie podczas treningu</SectionLabel>
+        {!adding && (
+          <button onClick={() => setAdding(true)} style={{
+            background: 'transparent', border: `1px solid ${C.border}`, color: C.lime,
+            cursor: 'pointer', padding: '4px 10px', borderRadius: 6, fontSize: 12, fontFamily: 'inherit',
+            display: 'inline-flex', alignItems: 'center', gap: 5,
+          }}>
+            <Plus size={12} /> Dodaj
+          </button>
+        )}
+      </div>
+
+      {items.length === 0 && !adding && (
+        <div style={{ fontSize: 12, color: C.muted }}>
+          Brak wpisów. Dodaj żele, izotonik, kofeinę z minutą przyjęcia — AI uwzględni to w analizie wpływu na tętno i tempo.
+        </div>
+      )}
+
+      {items.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: adding ? 14 : 0 }}>
+          {items.map(it => (
+            <div key={it.id} style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px',
+              background: C.surfaceAlt, borderRadius: 8,
+            }}>
+              <div className="mono" style={{ fontSize: 11, color: C.amber, minWidth: 52 }}>
+                {it.timeMin !== null ? `${it.timeMin} min` : '—'}
+              </div>
+              <div style={{ flex: 1, fontSize: 13, color: C.text }}>{it.product}</div>
+              <button onClick={() => removeItem(it.id)} style={{
+                background: 'transparent', border: 'none', color: C.muted, cursor: 'pointer', padding: 2,
+              }}>
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {adding && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 12, background: C.surfaceAlt, borderRadius: 8 }}>
+          <div>
+            <SectionLabel>Produkt</SectionLabel>
+            <select value={product} onChange={(e) => setProduct(e.target.value)} style={{
+              width: '100%', marginTop: 6, padding: '8px 10px', background: C.surface,
+              border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, fontFamily: 'inherit',
+            }}>
+              {NUTRITION_PRESETS.map(p => <option key={p} value={p}>{p}</option>)}
+              <option value="__custom__">Inny (wpisz)…</option>
+            </select>
+          </div>
+          {product === '__custom__' && (
+            <Input type="text" value={customProduct} onChange={(e) => setCustomProduct(e.target.value)} placeholder="Nazwa produktu" />
+          )}
+          <div>
+            <SectionLabel>Minuta przyjęcia {durationMin ? `(trening: ${durationMin} min)` : ''}</SectionLabel>
+            <Input type="number" value={timeMin} onChange={(e) => setTimeMin(e.target.value)}
+              placeholder="np. 22 (puste = przed startem)" suffix="min" />
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Btn variant="ghost" onClick={() => setAdding(false)}>Anuluj</Btn>
+            <Btn variant="primary" onClick={addItem}>Dodaj</Btn>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function MapView({ activity }) {
+  const containerRef = useRef(null);
+  const mapRef = useRef(null);
+  const [LeafletLib, setLeafletLib] = useState(null);
+
+  useEffect(() => {
+    if (LeafletLib) return;
+    import('leaflet').then(L => setLeafletLib(L.default || L));
+  }, [LeafletLib]);
+
+  useEffect(() => {
+    if (!LeafletLib || !containerRef.current || !activity?.samples) return;
+
+    const points = activity.samples
+      .filter(s => s.la !== null && s.la !== undefined && s.lo !== null && s.lo !== undefined)
+      .map(s => [s.la, s.lo]);
+
+    if (points.length < 2) return;
+
+    // Destroy previous map if any
+    if (mapRef.current) {
+      mapRef.current.remove();
+      mapRef.current = null;
+    }
+
+    const L = LeafletLib;
+    const map = L.map(containerRef.current, { zoomControl: true, scrollWheelZoom: false }).setView(points[0], 14);
+    mapRef.current = map;
+
+    // Dark map tiles from CartoDB
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap &copy; CARTO',
+      maxZoom: 18,
+    }).addTo(map);
+
+    const polyline = L.polyline(points, {
+      color: C.lime, weight: 4, opacity: 0.9, smoothFactor: 1.5,
+    }).addTo(map);
+
+    // Start marker (green)
+    L.circleMarker(points[0], {
+      radius: 6, color: '#fff', fillColor: C.lime, fillOpacity: 1, weight: 2,
+    }).addTo(map);
+    // End marker (red)
+    L.circleMarker(points[points.length - 1], {
+      radius: 6, color: '#fff', fillColor: C.red, fillOpacity: 1, weight: 2,
+    }).addTo(map);
+
+    map.fitBounds(polyline.getBounds(), { padding: [20, 20] });
+
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
+    };
+  }, [LeafletLib, activity]);
+
+  // Check if we have GPS data at all
+  const hasGPS = activity?.samples?.some(s => s.la !== null && s.la !== undefined);
+  if (!hasGPS) return null;
+
+  return (
+    <Card>
+      <SectionLabel>Trasa</SectionLabel>
+      <div
+        ref={containerRef}
+        style={{
+          marginTop: 12, height: 280, width: '100%',
+          background: C.surfaceAlt, borderRadius: 10, overflow: 'hidden',
+        }}
+      />
+      {!LeafletLib && (
+        <div style={{ marginTop: 8, fontSize: 11, color: C.muted, textAlign: 'center' }}>
+          Ładuję mapę...
         </div>
       )}
     </Card>
@@ -4410,7 +5081,7 @@ function WeeklyLoadChart({ planUnits, activities, todayISO }) {
   );
 }
 
-function Plan({ activities, pmcData, settings, setSettings, planOverrides, setPlanOverrides }) {
+function Plan({ activities, pmcData, settings, setSettings, planOverrides, setPlanOverrides, recovery }) {
   const todayISO = isoDay(new Date());
 
   const planUnits = useMemo(() => {
@@ -4507,7 +5178,7 @@ function Plan({ activities, pmcData, settings, setSettings, planOverrides, setPl
 
   const generateAiPlan = async () => {
     setAiLoading(true); setAiError(null);
-    const context = buildContext(activities, pmcData, settings);
+    const context = buildContext(activities, pmcData, settings, recovery);
     const system = `Jesteś ekspertem od treningu wytrzymałościowego. Wygeneruj plan tygodniowy w formacie JSON spójny z makrocyklem sportowca.
 Zwróć WYŁĄCZNIE poprawny JSON (bez \`\`\`json), strukturą:
 {
@@ -4683,7 +5354,8 @@ ${context}`;
                   </div>
                   {weekUnits.map((u) => {
                     const globalIdx = planUnits.findIndex(x => x.date === u.date);
-                    return <DayCell key={u.date} unit={u} onClick={() => setSelectedIdx(globalIdx)} isSelected={selectedIdx === globalIdx} />;
+                    const dayRecovery = (recovery || []).filter(r => r.date === u.date);
+                    return <DayCell key={u.date} unit={u} onClick={() => setSelectedIdx(globalIdx)} isSelected={selectedIdx === globalIdx} recoveryItems={dayRecovery} />;
                   })}
                 </React.Fragment>
               );
@@ -5084,6 +5756,7 @@ function Glossary() {
 function SettingsTab({ settings, setSettings, setActivities, setCoachHistory, setPlanOverrides }) {
   const [local, setLocal] = useState(settings);
   const [saved, setSaved] = useState(false);
+  const theme = useTheme();
 
   useEffect(() => { setLocal(settings); }, [settings]);
 
@@ -5112,6 +5785,37 @@ function SettingsTab({ settings, setSettings, setActivities, setCoachHistory, se
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 720 }}>
+      <Card>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 500, marginBottom: 4 }}>Motyw</div>
+            <div style={{ fontSize: 12, color: C.muted }}>
+              Tryb ciemny domyślny — łatwiejsze dla oczu, lepsze na telefonie. Jasny dostępny opcjonalnie.
+            </div>
+          </div>
+          <div style={{ display: 'inline-flex', gap: 4, padding: 3, background: C.surfaceAlt, borderRadius: 8, border: `1px solid ${C.border}` }}>
+            {[{k:'dark',label:'Ciemny'},{k:'light',label:'Jasny'}].map(opt => {
+              const active = theme.name === opt.k;
+              return (
+                <button
+                  key={opt.k}
+                  onClick={() => theme.set(opt.k)}
+                  style={{
+                    padding: '6px 14px', borderRadius: 6, border: 'none',
+                    background: active ? C.surface : 'transparent',
+                    color: active ? C.lime : C.textDim,
+                    fontSize: 13, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit',
+                    transition: 'all 0.15s',
+                  }}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </Card>
+
       <Card>
         <div style={{ fontSize: 16, fontWeight: 500, marginBottom: 4 }}>Strefy treningowe</div>
         <div style={{ fontSize: 12, color: C.muted, marginBottom: 20 }}>
@@ -5336,43 +6040,63 @@ function Header({ tab, setTab, authUser, onLogout }) {
     { id: 'coach',      label: 'Coach AI',   icon: Sparkles },
     { id: 'plan',       label: 'Plan',       icon: Target },
     { id: 'journal',    label: 'Dziennik',   icon: MessageSquare },
+    { id: 'recovery',   label: 'Regeneracja', icon: Activity },
     { id: 'glossary',   label: 'Wiedza',     icon: BookOpen },
     { id: 'settings',   label: 'Ustawienia', icon: SettingsIcon },
   ];
+  const [isNarrow, setIsNarrow] = useState(typeof window !== 'undefined' ? window.innerWidth < 720 : false);
+  useEffect(() => {
+    const onR = () => setIsNarrow(window.innerWidth < 720);
+    window.addEventListener('resize', onR);
+    return () => window.removeEventListener('resize', onR);
+  }, []);
+
   return (
     <header style={{
       borderBottom: `1px solid ${C.border}`, background: C.bg,
       position: 'sticky', top: 0, zIndex: 50,
     }}>
-      <div style={{ maxWidth: 1280, margin: '0 auto', padding: '20px 24px', display: 'flex', alignItems: 'center', gap: 40, flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ width: 32, height: 32, borderRadius: 8, background: C.lime, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Zap size={18} color="#ffffff" strokeWidth={2.5} />
+      <div style={{
+        maxWidth: 1280, margin: '0 auto',
+        padding: isNarrow ? '14px 16px' : '20px 24px',
+        display: 'flex', alignItems: 'center', gap: isNarrow ? 12 : 40, flexWrap: 'wrap',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ width: 32, height: 32, borderRadius: 8, background: C.lime, display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: `0 0 12px ${C.lime}40` }}>
+            <Zap size={18} color={C.bg} strokeWidth={2.5} />
           </div>
           <div>
-            <div style={{ fontSize: 18, fontWeight: 600, letterSpacing: '-0.02em' }}>PaceLab</div>
-            <div className="mono" style={{ fontSize: 10, color: C.muted, letterSpacing: '0.12em', textTransform: 'uppercase' }}>Endurance · Personal</div>
+            <div style={{ fontSize: isNarrow ? 16 : 18, fontWeight: 600, letterSpacing: '-0.02em' }}>PaceLab</div>
+            {!isNarrow && <div className="mono" style={{ fontSize: 10, color: C.muted, letterSpacing: '0.12em', textTransform: 'uppercase' }}>Endurance · Personal</div>}
           </div>
         </div>
-        <nav style={{ display: 'flex', gap: 4, marginLeft: 'auto', flexWrap: 'wrap' }}>
+        <nav style={{
+          display: 'flex', gap: isNarrow ? 2 : 4,
+          marginLeft: isNarrow ? 0 : 'auto',
+          flex: isNarrow ? '1 1 100%' : '0 1 auto',
+          overflowX: isNarrow ? 'auto' : 'visible',
+          WebkitOverflowScrolling: 'touch',
+          paddingBottom: isNarrow ? 2 : 0,
+        }}>
           {tabs.map(t => {
             const Icon = t.icon;
             const active = tab === t.id;
             return (
               <button key={t.id} onClick={() => setTab(t.id)} style={{
-                padding: '8px 14px', borderRadius: 8, border: 'none',
+                padding: isNarrow ? '8px 10px' : '8px 14px', borderRadius: 8, border: 'none',
                 background: active ? C.surfaceAlt : 'transparent',
                 color: active ? C.lime : C.textDim,
                 fontSize: 13, fontWeight: 500, cursor: 'pointer',
-                display: 'inline-flex', alignItems: 'center', gap: 8,
+                display: 'inline-flex', alignItems: 'center', gap: isNarrow ? 0 : 8,
                 fontFamily: 'inherit', transition: 'all 0.15s',
+                whiteSpace: 'nowrap', flexShrink: 0,
               }}>
-                <Icon size={14} /> {t.label}
+                <Icon size={14} /> {!isNarrow && t.label}
               </button>
             );
           })}
         </nav>
-        {authUser && (
+        {authUser && !isNarrow && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingLeft: 12, borderLeft: `1px solid ${C.border}` }}>
             <div style={{ fontSize: 11, color: C.muted, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={authUser.email}>
               {authUser.email}
@@ -5390,8 +6114,198 @@ function Header({ tab, setTab, authUser, onLogout }) {
             </button>
           </div>
         )}
+        {authUser && isNarrow && (
+          <button onClick={onLogout} title="Wyloguj" style={{
+            background: 'transparent', border: 'none', color: C.muted, cursor: 'pointer', padding: 4, marginLeft: 'auto',
+          }}>
+            <LogOut size={14} />
+          </button>
+        )}
       </div>
     </header>
+  );
+}
+
+const RECOVERY_TYPES = {
+  physio:     { label: 'Fizjoterapia', icon: '🩺', color: '#ff4d9a' },
+  rolling:    { label: 'Rolowanie',    icon: '🟦', color: '#33d9ff' },
+  massage:    { label: 'Masaż',        icon: '💆', color: '#a3ff3a' },
+  stretching: { label: 'Stretching',   icon: '🧘', color: '#ffba2e' },
+  sauna:      { label: 'Sauna / zimno', icon: '🔥', color: '#ff5547' },
+};
+
+function RecoveryModal({ entry, onSave, onClose }) {
+  const [date, setDate] = useState(entry?.date || isoDay(new Date()));
+  const [type, setType] = useState(entry?.type || 'rolling');
+  const [areas, setAreas] = useState(entry?.areas || '');
+  const [notes, setNotes] = useState(entry?.notes || '');
+  const [durationMin, setDurationMin] = useState(entry?.durationMin || '');
+
+  const save = () => {
+    onSave({
+      id: entry?.id || Date.now(),
+      date, type, areas: areas.trim(), notes: notes.trim(),
+      durationMin: durationMin === '' ? null : Number(durationMin),
+    });
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 100,
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }} onClick={onClose}>
+      <Card style={{ width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }} >
+        <div onClick={(e) => e.stopPropagation()}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <div style={{ fontSize: 18, fontWeight: 600 }}>{entry ? 'Edytuj wpis' : 'Nowy wpis regeneracji'}</div>
+            <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: C.muted, cursor: 'pointer' }}><X size={18} /></button>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div>
+              <SectionLabel>Typ</SectionLabel>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(90px, 1fr))', gap: 6, marginTop: 6 }}>
+                {Object.entries(RECOVERY_TYPES).map(([k, v]) => (
+                  <button key={k} onClick={() => setType(k)} style={{
+                    padding: '10px 6px', borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
+                    background: type === k ? v.color + '22' : 'transparent',
+                    border: `1px solid ${type === k ? v.color : C.border}`,
+                    color: type === k ? v.color : C.textDim, fontSize: 12, fontWeight: 500,
+                    display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4,
+                  }}>
+                    <span style={{ fontSize: 18 }}>{v.icon}</span>
+                    {v.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div>
+                <SectionLabel>Data</SectionLabel>
+                <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+              </div>
+              <div>
+                <SectionLabel>Czas trwania</SectionLabel>
+                <Input type="number" value={durationMin} onChange={(e) => setDurationMin(e.target.value)} placeholder="min" suffix="min" />
+              </div>
+            </div>
+
+            <div>
+              <SectionLabel>Obszary ciała</SectionLabel>
+              <Input type="text" value={areas} onChange={(e) => setAreas(e.target.value)}
+                placeholder="np. odcinek L4-L5, prawe kolano, łydki" />
+            </div>
+
+            <div>
+              <SectionLabel>Co zostało zrobione / zalecenia</SectionLabel>
+              <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={4}
+                placeholder="np. mobilizacja odcinka lędźwiowego, terapia manualna prawego kolana. Fizjo zalecił 3 dni bez biegania, dozwolony rower Z2."
+                style={{ width: '100%', background: C.surfaceAlt, border: `1px solid ${C.border}`,
+                  borderRadius: 8, padding: '10px 12px', color: C.text, fontSize: 14,
+                  fontFamily: 'inherit', outline: 'none', resize: 'vertical', marginTop: 6, lineHeight: 1.5 }} />
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+              <Btn variant="ghost" onClick={onClose}>Anuluj</Btn>
+              <Btn variant="primary" onClick={save}>Zapisz</Btn>
+            </div>
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function Recovery({ recovery, setRecovery }) {
+  const [modal, setModal] = useState(null); // null | {} | entry
+
+  const sorted = useMemo(() =>
+    [...(recovery || [])].sort((a, b) => new Date(b.date) - new Date(a.date)),
+  [recovery]);
+
+  const save = (entry) => {
+    setRecovery(prev => {
+      const exists = (prev || []).some(e => e.id === entry.id);
+      if (exists) return prev.map(e => e.id === entry.id ? entry : e);
+      return [...(prev || []), entry];
+    });
+    setModal(null);
+  };
+
+  const remove = (id) => {
+    if (!confirm('Usunąć ten wpis?')) return;
+    setRecovery(prev => (prev || []).filter(e => e.id !== id));
+  };
+
+  // Stats
+  const now = new Date();
+  const last30 = sorted.filter(e => (now - new Date(e.date)) / 86400000 <= 30);
+  const physioCount = last30.filter(e => e.type === 'physio').length;
+  const rollingCount = last30.filter(e => e.type === 'rolling').length;
+  const lastPhysio = sorted.find(e => e.type === 'physio');
+  const daysSincePhysio = lastPhysio ? Math.floor((now - new Date(lastPhysio.date)) / 86400000) : null;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 600, letterSpacing: '-0.02em' }}>Regeneracja</div>
+          <div style={{ fontSize: 13, color: C.muted, marginTop: 4 }}>
+            Fizjoterapia, rolowanie, stretching. AI uwzględnia te wpisy w planowaniu treningów.
+          </div>
+        </div>
+        <Btn variant="primary" icon={Plus} onClick={() => setModal({})}>Dodaj wpis</Btn>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12 }}>
+        <KPI label="Fizjo (30 dni)" value={physioCount} sub={daysSincePhysio !== null ? `ostatnia ${daysSincePhysio} dni temu` : 'brak wpisów'} accent={C.pink} />
+        <KPI label="Rolowanie (30 dni)" value={rollingCount} sub="sesje" accent={C.cyan} />
+        <KPI label="Wszystkie (30 dni)" value={last30.length} sub="sesje regeneracji" accent={C.lime} />
+      </div>
+
+      <Card>
+        <SectionLabel>Historia</SectionLabel>
+        {sorted.length === 0 ? (
+          <div style={{ color: C.muted, textAlign: 'center', padding: 32, fontSize: 13 }}>
+            Brak wpisów. Dodaj wizytę u fizjo lub sesję rolowania.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12 }}>
+            {sorted.map(e => {
+              const meta = RECOVERY_TYPES[e.type] || RECOVERY_TYPES.rolling;
+              return (
+                <div key={e.id} style={{
+                  display: 'flex', gap: 12, padding: '12px 14px', background: C.surfaceAlt,
+                  borderRadius: 10, borderLeft: `3px solid ${meta.color}`, alignItems: 'flex-start',
+                }}>
+                  <div style={{ fontSize: 20 }}>{meta.icon}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 14, fontWeight: 500, color: meta.color }}>{meta.label}</span>
+                      <span className="mono" style={{ fontSize: 11, color: C.muted }}>{fmtDateFull(e.date)}</span>
+                      {e.durationMin && <span className="mono" style={{ fontSize: 11, color: C.muted }}>· {e.durationMin} min</span>}
+                    </div>
+                    {e.areas && <div style={{ fontSize: 13, color: C.textDim, marginTop: 4 }}><strong>Obszary:</strong> {e.areas}</div>}
+                    {e.notes && <div style={{ fontSize: 13, color: C.textDim, marginTop: 4, lineHeight: 1.5 }}>{e.notes}</div>}
+                  </div>
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    <button onClick={() => setModal(e)} style={{ background: 'transparent', border: 'none', color: C.muted, cursor: 'pointer', padding: 4 }}><Edit2 size={13} /></button>
+                    <button onClick={() => remove(e.id)} style={{ background: 'transparent', border: 'none', color: C.muted, cursor: 'pointer', padding: 4 }}><Trash2 size={13} /></button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
+      {modal !== null && (
+        <RecoveryModal
+          entry={modal && modal.id ? modal : null}
+          onSave={save}
+          onClose={() => setModal(null)}
+        />
+      )}
+    </div>
   );
 }
 
@@ -5401,6 +6315,7 @@ function App({ authUser }) {
   const [coachHistory, setCoachHistory] = useState([]);
   const [planOverrides, setPlanOverrides] = useState({});
   const [journal, setJournal] = useState([]);
+  const [recovery, setRecovery] = useState([]);
   const [tab, setTab] = useState('dashboard');
   const [loaded, setLoaded] = useState(false);
   const [importStatus, setImportStatus] = useState(null);
@@ -5416,6 +6331,7 @@ function App({ authUser }) {
         if (s.coachHistory) setCoachHistory(s.coachHistory);
         if (s.planOverrides) setPlanOverrides(s.planOverrides);
         if (s.journal) setJournal(s.journal);
+        if (s.recovery) setRecovery(s.recovery);
       }
       setLoaded(true);
     })();
@@ -5423,8 +6339,8 @@ function App({ authUser }) {
 
   useEffect(() => {
     if (!loaded) return;
-    saveState({ activities, settings, coachHistory, planOverrides, journal });
-  }, [activities, settings, coachHistory, planOverrides, journal, loaded]);
+    saveState({ activities, settings, coachHistory, planOverrides, journal, recovery });
+  }, [activities, settings, coachHistory, planOverrides, journal, recovery, loaded]);
 
   useEffect(() => {
     if (!loaded || activities.length === 0) return;
@@ -5562,13 +6478,15 @@ function App({ authUser }) {
             pmcData={pmcData}
             planOverrides={planOverrides}
             setPlanOverrides={setPlanOverrides}
+            recovery={recovery}
           />
         )}
         {tab === 'dashboard'  && <Dashboard activities={activities} pmcData={pmcData} today={today} settings={settings} onImport={handleFiles} importStatus={importStatus} todayPlanUnit={todayPlanUnit} onSkip={(date, note) => setPlanOverrides({...(planOverrides||{}), [date]: {action:'skip', note: note||'', ts: new Date().toISOString()}})} onUnskip={(date) => { const n = {...(planOverrides||{})}; delete n[date]; setPlanOverrides(n); }} onMarkStrength={markStrengthDone} onAddManual={(date) => setGlobalManualModal({ date })} onOpenVoice={(opts) => { setVoiceModal(opts || {}); }} />}
-        {tab === 'activities' && <Activities activities={activities} setActivities={setActivities} pmcData={pmcData} settings={settings} />}
-        {tab === 'coach'      && <Coach activities={activities} pmcData={pmcData} settings={settings} history={coachHistory} setHistory={setCoachHistory} />}
-        {tab === 'plan'       && <Plan activities={activities} pmcData={pmcData} settings={settings} setSettings={setSettings} planOverrides={planOverrides} setPlanOverrides={setPlanOverrides} />}
+        {tab === 'activities' && <Activities activities={activities} setActivities={setActivities} pmcData={pmcData} settings={settings} recovery={recovery} />}
+        {tab === 'coach'      && <Coach activities={activities} pmcData={pmcData} settings={settings} history={coachHistory} setHistory={setCoachHistory} recovery={recovery} />}
+        {tab === 'plan'       && <Plan activities={activities} pmcData={pmcData} settings={settings} setSettings={setSettings} planOverrides={planOverrides} setPlanOverrides={setPlanOverrides} recovery={recovery} />}
         {tab === 'journal'    && <Journal journal={journal} setJournal={setJournal} onOpenNew={() => setVoiceModal({})} activities={activities} />}
+        {tab === 'recovery'   && <Recovery recovery={recovery} setRecovery={setRecovery} />}
         {tab === 'glossary'   && <Glossary />}
         {tab === 'settings'   && <SettingsTab settings={settings} setSettings={setSettings} setActivities={setActivities} setCoachHistory={setCoachHistory} setPlanOverrides={setPlanOverrides} />}
       </main>
@@ -5803,6 +6721,9 @@ function MigrationPrompt({ user, onDone }) {
 }
 
 export default function AppRoot() {
+  // Subscribe to theme so the whole tree re-renders on toggle
+  useTheme();
+
   const [authChecked, setAuthChecked] = useState(!isSupabaseEnabled);
   const [authUser, setAuthUser] = useState(null);
   const [needsMigration, setNeedsMigration] = useState(false);

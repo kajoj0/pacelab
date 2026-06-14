@@ -10,7 +10,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-react": "^7.29.7",
     "@supabase/supabase-js": "^2.45.0",
+    "esbuild": "^0.28.1",
+    "leaflet": "^1.9.4",
     "lucide-react": "^0.383.0",
     "papaparse": "^5.4.1",
     "react": "^18.3.1",

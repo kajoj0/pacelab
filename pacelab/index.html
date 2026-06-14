@@ -2,21 +2,22 @@
 <html lang="pl">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#fafbfc" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
+    <meta name="theme-color" content="#0a0d12" />
     <title>PaceLab — Endurance Training</title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235a8a00'/%3E%3Cpath d='M11 6 L18 18 L13 18 L21 26 L14 14 L19 14 Z' fill='%23ffffff'/%3E%3C/svg%3E" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23a3ff3a'/%3E%3Cpath d='M11 6 L18 18 L13 18 L21 26 L14 14 L19 14 Z' fill='%230a0d12'/%3E%3C/svg%3E" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
     <style>
       html, body, #root {
         height: 100%;
         margin: 0;
       }
       body {
-        background: #fafbfc;
-        color: #0f1419;
+        background: #0a0d12;
+        color: #e8edf3;
         font-family: 'Geist', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
         font-size: 15px;
         line-height: 1.55;
@@ -31,8 +32,20 @@
       .serif { font-family: 'Instrument Serif', Georgia, serif; }
       ::-webkit-scrollbar { width: 10px; height: 10px; }
       ::-webkit-scrollbar-track { background: transparent; }
-      ::-webkit-scrollbar-thumb { background: #d2d8de; border-radius: 5px; }
-      ::-webkit-scrollbar-thumb:hover { background: #6b7680; }
+      ::-webkit-scrollbar-thumb { background: #2d3845; border-radius: 5px; }
+      ::-webkit-scrollbar-thumb:hover { background: #4a5663; }
+
+      /* Leaflet container override — fits PaceLab card style */
+      .leaflet-container { background: #11161d; border-radius: 10px; font-family: inherit; }
+      .leaflet-tile-pane { filter: brightness(0.85) contrast(1.05); }
+      .leaflet-control-attribution { background: rgba(17, 22, 29, 0.85) !important; color: #a3afbe !important; font-size: 10px !important; }
+      .leaflet-control-attribution a { color: #33d9ff !important; }
+      .leaflet-control-zoom a { background: #11161d !important; color: #e8edf3 !important; border: 1px solid #1f2733 !important; }
+
+      /* Mobile responsiveness — hide horizontal overflow */
+      @media (max-width: 600px) {
+        body { font-size: 14px; }
+      }
     </style>
   </head>
   <body>
